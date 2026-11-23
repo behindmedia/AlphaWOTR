@@ -2669,6 +2669,22 @@ def setup_card_choice(bot, st, dec, view):
             'decider': 'fp', 'direct': True,
             'options': chain + [{'_ents_chain_done': True}]}
         return ('action', None)
+    if me is FP and str(ctx.get('card', '')) == 'fp-strat-06' and \
+            str(ctx.get('question', '')) == 'Recruit which Gondor unit?':
+        # Faramir's Rangers' recruitment in Osgiliath after the strike
+        # (event_effects._effect_faramirs_rangers: the engine's own pending
+        # {'_far_recruit': True, 'unit_type': kind}); asked here when the
+        # engine's copy of the card rolled other dice than the referee's
+        import event_effects
+        options = event_effects._faramir_recruit_options(st)
+        if options:
+            cid = bot.names.card('fp-strat-06')
+            st.pending_card_option = {
+                'card_id': cid or "FREE_PEOPLES_Strategy_Faramir's_Rangers",
+                'card_name': "Faramir's Rangers", 'side': 'fp',
+                'decider': 'fp', 'direct': True, 'faramir_recruit': True,
+                'options': options}
+            return ('action', None)
     draws = [o for o in opts(dec, 'draw') if not o.get('skip')]
     if draws and me is SH:
         # the Palantir of Orthanc's bonus draw (ai._open_palantir_deck_choice)
