@@ -88,6 +88,10 @@ A protocol bot on stdin/stdout (one JSON message a line), e.g. under a referee:
 
     node wasm/worker/aw-stdio.mjs DATA --sims 300 [--module build/alphawotr-simd.mjs]
 
+The bot writes to stderr one line for each answer it could not take from the engine (`[aw] default GAME KIND: why`)
+and one line at each game's end (`[aw] game over GAME: N decisions (the answers by how, as the Python adapter's
+info.how), D defaults`); `aw_create`'s `"report": false` turns them off.
+
 In a page: start `worker/alphawotr-worker.js` as a module worker, post `{init: {base: URL, sims}}` once (URL: the
 folder with the module and the data files, fetched from there and cached by the browser), then `{line: MESSAGE}` for
 each referee message; the worker posts `{ready}` (or `{error}`), then `{line: REPLY}` for each reply. The SIMD build
@@ -127,6 +131,20 @@ is worked out once (the search takes the bot's projection, `awdec::Projection`),
 time: their `SECONDS` (15 s), on a per-decision clock the answer's deadline less 40 ms (`certain_line.DEADLINE`), and
 the module's own cap `certain_seconds` (1 s; `aw_create`'s config), so it cannot hold a decision up for seconds. A line
 the cap cuts gives no verdict, which can only keep the search's own pick.
+
+**The official rules (2026-11-23, wotr #1371).** The Python adapter's changes for the referee's official rules are
+ported: a scenario's played moves re-entered (`Bot::reenter`, `Bot::follow`), the board diff shared by the chain and
+the card mappings (`Adapter::board_diff`, `diff_pick`, `question_region`), the plans per engine action (SeparatePlan
+per action and to any destination on the Mordor Track, RageSplitPlan, EyeDicePlan), the card mappings (Stormcrow,
+The Ents Awake's chain, Gwaihir / We Prove Swifter, the recruitment allocations by the board they make, The Lidless
+Eye, Rage of the Dunlendings, I Will Go Alone), the set-ups (Stormcrow, The Ents Awake, Faramir's Rangers' recruitment,
+Mighty Attack's payer by ai_policies' rule, the Palantir's draw without its skip), the Leader re-roll rule. An
+advance's plan is made for the row the search picks only (the box checks every applied row against the menu it works
+out again: applying all of an advance's 1,417 rows took 4 s natively and timed the module out). Checks:
+`bot_parity` on transcripts recorded with the Python adapter of the same commit (the 12 of p4 again, 2,729 of 2,729;
+the certification's 13 scenarios and 8 games with these cards, 491 of 491; the same `how` for every answer), and the
+referee's certification run (`cli protocol-certify`) through `aw-stdio.mjs`. `record_build_state.py` takes the
+search's `legal` argument (2026-11-18) again.
 
 A known difference: Emscripten's libm can differ from another platform's in the last bit of `pow`, `log` or `exp`,
 which can flip a very close choice, as between the native platforms themselves.

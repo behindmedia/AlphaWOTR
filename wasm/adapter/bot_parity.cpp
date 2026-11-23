@@ -19,6 +19,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -149,7 +150,15 @@ int main(int argc, char** argv) {
             if (args_off || !args.empty()) ++search_args_off;
             if (applies_off || !applies.empty()) ++applies_off_n;
             total_drew += applies_drew;
-            if (tr_.how != how) ++cpp_how_diff[how + " -> " + tr_.how];
+            if (tr_.how != how) {
+                ++cpp_how_diff[how + " -> " + tr_.how];
+                if (std::getenv("AW_PARITY_HOW")) {   // the decisions whose how differs (the answer may be the same)
+                    const auto* dec = m.get("decision");
+                    std::printf("how %s #%zu %s: C++ %lld (%s%s%s), Python %lld (%s)\n", tr.c_str(), total,
+                                dec && dec->get("kind") ? dec->get("kind")->s.c_str() : "?", tr_.o ? (long long)*tr_.o : -1LL,
+                                tr_.how.c_str(), tr_.note.empty() ? "" : ": ", tr_.note.c_str(), (long long)want, how.c_str());
+                }
+            }
             if (!ok && (verbose || shown < 20)) {
                 ++shown;
                 const auto* dec = m.get("decision");

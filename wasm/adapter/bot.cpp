@@ -120,6 +120,13 @@ std::string Bot::handle(const Value& msg) {
         if (own_rng) wotr_random_destroy(own_rng);
         own_rng = wotr_random_create_seeded(limbs, (seed >> 32) ? 2 : 1);   // random.seed(seed_bot): the global stream
         plan.reset(); drop_work(); in_game = true;
+        hows.clear();
+        game = at(msg, "game").kind == Value::Str ? at(msg, "game").s : "";
+        start_view.reset(); prefix.reset();
+        if (at(msg, "start").kind == Value::Str && at(msg, "start").s == "position" && at(msg, "played_for_you").truthy()) {
+            start_view = at(msg, "view");
+            prefix = std::vector<Value>();
+        }
         clock_kind = at(or_empty(msg, "clock"), "kind").kind == Value::Str ? at(or_empty(msg, "clock"), "kind").s : "";
         return "{\"type\":\"ready\",\"id\":" + json_of(at(msg, "id")) + "}";
     }
@@ -136,6 +143,7 @@ std::string Bot::handle(const Value& msg) {
         if (!in_game) return "";
         const Value& ev = or_empty(msg, "event");
         const std::string k = at(ev, "kind").kind == Value::Str ? at(ev, "kind").s : "";
+        if (prefix && k == "choice") prefix->push_back(ev);
         if (k == "turn_started") { memo.messenger_used = false; memo.fellowship_acted = false; }
         else if (k == "fellowship_entered_mordor") memo.in_mordor = true;
         else if (k == "fellowship_moved" || k == "fellowship_hidden") { if (memo.in_mordor) memo.fellowship_acted = true; }
@@ -147,7 +155,16 @@ std::string Bot::handle(const Value& msg) {
         return "";
     }
     if (ty == "decide") return decide(msg);
-    if (ty == "game_over") { in_game = false; return ""; }
+    if (ty == "game_over") {
+        in_game = false;
+        if (report) {   // the Python adapter's game-over line: the answers by how
+            int64_t n = 0; std::string parts;
+            for (const auto& [h, c] : hows) { n += c; parts += (parts.empty() ? "" : ", ") + h + " " + std::to_string(c); }
+            const int64_t defaults = (hows.count("default") ? hows.at("default") : 0) + (hows.count("error-default") ? hows.at("error-default") : 0);
+            std::fprintf(stderr, "[aw] game over %s: %lld decisions (%s), %lld defaults\n", game.c_str(), (long long)n, parts.c_str(), (long long)defaults);
+        }
+        return "";
+    }
     return "";
 }
 
@@ -177,6 +194,10 @@ std::string Bot::decide(const Value& msg) {
         plan.reset();
     }
     last.o = o; last.how = how;
+    ++hows[how];
+    if (report && (how == "default" || how == "error-default"))
+        std::fprintf(stderr, "[aw] %s %s %s: %s\n", how.c_str(), game.c_str(), at(dec, "kind").s.c_str(),
+                     last.note.empty() ? (last.unported.empty() ? "no engine decision" : last.unported.c_str()) : last.note.c_str());
     return "{\"type\":\"choice\",\"id\":" + json_of(at(msg, "id")) + ",\"o\":" + std::to_string(*o) + ",\"fingerprint\":" +
            json_of(at(dec, "fingerprint")) + ",\"info\":{\"how\":" + json_str(how) + "}}";
 }
@@ -212,7 +233,7 @@ awad::Adapter::Row row_of(const Menu& mn, size_t ri) {
     awgt::G ga{mn.mg};
     const auto parts = ga.kids(mn.rowsn[ri]);
     awad::Adapter::Row row; row.die = mn.mg.values[parts[0]].integer; row.type = ga.text(parts[1]);
-    row.params = awgt::to_value(ga, parts[2]); row.menu = mn.full; row.index = int64_t(ri);
+    row.params = awgt::to_value(ga, parts[2]); row.menu = mn.full; row.index = int64_t(ri); row.sn = mn.sn;
     return row;
 }
 bool is_none(pyobj::Obj* w, const char* name) {
@@ -225,6 +246,20 @@ std::string text_of(const Value& v) { return v.kind == Value::Str ? v.s : v.kind
 std::pair<std::optional<int64_t>, std::string> Bot::decide_(const Value& dec, const Value& view, std::optional<double> left) {
     const std::string kind = at(dec, "kind").s;
     const Value& options = or_empty(dec, "options");
+    if (prefix) {   // the first question of a game from a position: the referee may have begun the bot's own action
+        const std::vector<Value> pre = std::move(*prefix);
+        prefix.reset();
+        if (CHAIN_KINDS.count(kind)) {   // (half the clock: the question itself has the rest)
+            const auto dl = answer_deadline;
+            if (dl) { const auto now = std::chrono::steady_clock::now(); answer_deadline = now + (*dl > now ? (*dl - now) / 2 : std::chrono::steady_clock::duration(0)); }
+            try { reenter(pre, left ? std::optional<double>(*left / 2.0) : std::nullopt); }
+            catch (const std::exception& e) {
+                if (report) std::fprintf(stderr, "[aw] ! %s: re-entering the played action: %s\n", game.c_str(), e.what());
+                plan.reset(); drop_work();
+            }
+            answer_deadline = dl;
+        }
+    }
     if (options.arr.size() == 1) {
         if (plan && plan->takes(kind)) { try { plan->answer(dec); } catch (...) { plan.reset(); } }   // _continue_plan_quietly
         return {at(options.arr[0], "o").is_null() ? std::nullopt : std::optional<int64_t>(at(options.arr[0], "o").as_int()), "only"};
@@ -256,6 +291,7 @@ std::pair<std::optional<int64_t>, std::string> Bot::decide_(const Value& dec, co
         bool has = false;
         const auto o = awad::rule(t, kind, dec, view, memo.side, work != nullptr, &has);
         if (o) return {o, "rule"};
+        last.note = "no engine decision for " + kind;
         return {std::nullopt, "default"};
     }
     if (su.has_match) return {su.match_none ? std::nullopt : std::optional<int64_t>(su.match), "rule"};
@@ -370,7 +406,7 @@ std::pair<std::optional<int64_t>, std::string> Bot::search_and_map(pyobj::Obj* s
     const auto tm = std::chrono::steady_clock::now();
     auto mn = menu_of(m, st, ad.obs_tables, memo.side);
     last.menu_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm).count();
-    if (mn->rows.empty()) return {std::nullopt, "default"};
+    if (mn->rows.empty()) { last.note = "engine has no action"; return {std::nullopt, "default"}; }
     std::vector<Matched> mts;   // every row matched to an option (map_action), the rest banned
     for (size_t ri = 0; ri < mn->rowsn.size(); ++ri) {
         Matched mt;
@@ -381,7 +417,7 @@ std::pair<std::optional<int64_t>, std::string> Bot::search_and_map(pyobj::Obj* s
     std::set<std::string> banned;
     std::vector<size_t> mapped;
     for (size_t ri = 0; ri < mts.size(); ++ri) { if (mts[ri].ok) mapped.push_back(ri); else banned.insert(mn->rows[ri]); }
-    if (mapped.empty()) { if (!flag.empty()) m.set_attr(st, flag, m.boolean(false)); return {std::nullopt, "default"}; }
+    if (mapped.empty()) { if (!flag.empty()) m.set_attr(st, flag, m.boolean(false)); last.note = "no engine action matches an option"; return {std::nullopt, "default"}; }
     bool single = true;
     for (size_t q : mapped) single &= mts[q].o == mts[mapped[0]].o && mts[q].o_none == mts[mapped[0]].o_none && !mts[q].has_plan && !mts[q].chain;
     if (single) {
@@ -407,7 +443,7 @@ std::pair<std::optional<int64_t>, std::string> Bot::search_and_map(pyobj::Obj* s
             awgt::G gu{ug};
             const auto parts = gu.kids(gu.kids(ug.root)[0]);
             awad::Adapter::Row row; row.die = ug.values[parts[0]].integer; row.type = gu.text(parts[1]);
-            row.params = awgt::to_value(gu, parts[2]); row.menu = units_menu; row.index = 0;
+            row.params = awgt::to_value(gu, parts[2]); row.menu = units_menu; row.index = 0; row.sn = mn->sn;
             try { units_mt = ad.map_action(kind, st, dec, row, memo); } catch (...) { units_mt = Matched(); }
             if (units_mt.ok) { chosen = &units_mt; a_menu = units_menu; a_index = 0; last.engine = pick; last.note = "the seat's unit rule"; }
         }
@@ -423,7 +459,15 @@ std::pair<std::optional<int64_t>, std::string> Bot::search_and_map(pyobj::Obj* s
             const pyobj::Graph& gg = a_menu == mn->full ? mn->mg : ag;
             awgt::G ga{gg};
             const auto rr = ga.kids(gg.root);
-            work_action = ga.text(ga.kids(rr[size_t(a_menu == mn->full ? a_index : 0)])[1]);
+            const auto parts = ga.kids(rr[size_t(a_menu == mn->full ? a_index : 0)]);
+            work_action = ga.text(parts[1]);
+            // the card the engine's action plays (its questions follow)
+            work_card.clear();
+            if (work_action == "play_event") {
+                const Value pv = awgt::to_value(ga, parts[2]);
+                const Value& cid = at(pv, "card_id");
+                if (cid.kind == Value::Str) { auto it = t.card_out.find(cid.s); if (it != t.card_out.end()) work_card = it->second; }
+            }
         }
         work_base = st;
         diff.reset();
@@ -466,7 +510,12 @@ std::optional<std::pair<std::optional<int64_t>, std::string>> Bot::chain(const V
     Matched& mt = mts[at_i];
     const auto o = mt.option();
     plan = mt.plan();
+    pyobj::Obj* before = work;
     work = apply_copy(mn->sn, mn->full, int64_t(at_i), "");
+    if (mt.diff) {   // the link's board diff, as its first answer read it (the questions that follow go on reading it)
+        work_base = before;
+        diff = *mt.diff;
+    }
     return std::make_pair(o, std::string("chain"));
 }
 
@@ -499,138 +548,69 @@ bool Bot::chain_over(pyobj::Obj* w, const std::string& kind) {
     return false;
 }
 
-// figure_counts(st, names): {(region slug, nation, unit): n} in the map's order, and {(region slug, character)}
-void Bot::figure_counts(pyobj::Obj* st, std::vector<std::pair<Key, int64_t>>& out, std::set<std::pair<std::string, std::string>>& chars) {
-    using M = pyobj::Model;
-    pyobj::Obj* armies = M::attr(st, "armies");
-    for (size_t j = 0; j + 1 < armies->k.size(); j += 2) {
-        const std::string k = armies->k[j]->s;
-        std::string sl = ad.slug(k);
-        if (sl.empty()) sl = "\x01";
-        for (int side : {0, 1}) {
-            const auto f = ad.figures(st, k, side);
-            for (const auto& [nu, n] : f.units) {
-                const Key key{sl, nu.first, nu.second};
-                auto it = std::find_if(out.begin(), out.end(), [&](auto& e) { return e.first == key; });
-                if (it == out.end()) out.push_back({key, n}); else it->second += n;
-            }
-            for (const auto& c : f.chars) chars.insert({sl, c});
-        }
-    }
-}
-
+// diff_answer: a card question the engine settled inside its action, read off its board after the action
 std::optional<int64_t> Bot::diff_answer(const Value& dec) {
     const std::string kind = at(dec, "kind").s;
-    if (!work || !work_base || (kind != "CARD_CHOICE" && kind != "ARMY_SELECTION" && kind != "ARMY_MOVE")) return std::nullopt;
-    if (!diff) {
-        std::vector<std::pair<Key, int64_t>> b, w;
-        std::set<std::pair<std::string, std::string>> bc, wc;
-        figure_counts(work_base, b, bc);
-        figure_counts(work, w, wc);
-        Diff d;
-        std::vector<Key> keys;   // set(b) | set(w) (here: b's keys, then w's new ones)
-        for (auto& e : b) keys.push_back(e.first);
-        for (auto& e : w) if (std::find(keys.begin(), keys.end(), e.first) == keys.end()) keys.push_back(e.first);
-        auto get = [](const std::vector<std::pair<Key, int64_t>>& v, const Key& k) { for (auto& e : v) if (e.first == k) return e.second; return int64_t(0); };
-        for (const auto& k : keys) {
-            const int64_t dd = get(w, k) - get(b, k);
-            if (dd > 0) d.added.push_back({k, dd}); else if (dd < 0) d.removed.push_back({k, -dd});
-        }
-        for (auto& c : wc) if (!bc.count(c)) d.chars_to.insert(c);
-        for (auto& c : bc) if (!wc.count(c)) d.chars_from.insert(c);
-        diff = d;
-    }
-    Diff& d = *diff;
-    const Value& ctx = or_empty(dec, "context");
-    auto any_region = [](const std::vector<std::pair<Key, int64_t>>& v, const std::string& r, bool pos) {
-        for (auto& e : v) if (std::get<0>(e.first) == r && (!pos || e.second > 0)) return true; return false; };
-    if (kind == "ARMY_MOVE") {   // a card's Army moves the engine made inside the card
-        if (work_action != "play_event") return std::nullopt;
-        int best_s = -1; std::optional<int64_t> best_o; std::pair<std::string, std::string> best_m;
-        for (auto* o : opts(dec, "army_move")) {
-            const std::string f = text_of(at(*o, "from")), to = text_of(at(*o, "to"));
-            if (d.moves_done.count({f, to})) continue;
-            const int s = 2 * any_region(d.removed, f, true) + 2 * any_region(d.added, to, true);
-            if (s >= 4 && (best_s < 0 || s > best_s)) { best_s = s; best_o = has_o(o) ? std::optional<int64_t>(at(*o, "o").as_int()) : std::nullopt; best_m = {f, to}; }
-        }
-        if (best_s >= 0) { d.moves_done.insert(best_m); return best_o; }
-        const auto e = opts(dec, "end");
-        return (!e.empty() && has_o(e[0])) ? std::optional<int64_t>(at(*e[0], "o").as_int()) : std::nullopt;
-    }
-    if (kind == "ARMY_SELECTION") {   // a card's Army move: as many as left the region in the engine
-        const std::string frm = text_of(at(ctx, "from"));
-        const Value* best = nullptr; int64_t bd = 0;
-        auto nat_of = [&](const Value& o) { const Value& x = at(o, "nation"); return text_of(x.truthy() ? x : at(ctx, "nation")); };
-        auto unit_of = [&](const Value& o) { const Value& x = at(o, "unit"); return text_of(x.truthy() ? x : at(ctx, "unit")); };
-        for (auto* o : opts(dec, "count")) {
-            int64_t want = 0;
-            if (at(*o, "character").truthy()) want = d.chars_from.count({frm, text_of(at(*o, "character"))}) ? 1 : 0;
-            else { const Key k{frm, nat_of(*o), unit_of(*o)}; for (auto& e : d.removed) if (e.first == k) want = e.second; }
-            const int64_t dd = std::llabs((o->get("count") ? at(*o, "count").as_int() : 0) - want);
-            if (!best || dd < bd) { best = o; bd = dd; }
-        }
-        if (!best) return std::nullopt;
-        if (!at(*best, "character").truthy()) {
-            const Key k{frm, nat_of(*best), unit_of(*best)};
-            for (auto& e : d.removed) if (e.first == k) e.second = std::max<int64_t>(0, e.second - (best->get("count") ? at(*best, "count").as_int() : 0));
-        }
-        return has_o(best) ? std::optional<int64_t>(at(*best, "o").as_int()) : std::nullopt;
-    }
-    // a card's question: the words of its question, the answers' words
-    std::string q = at(ctx, "question").kind == Value::Str ? at(ctx, "question").s : (at(ctx, "question").is_null() ? "" : "?");
-    if (!ctx.get("question")) q = "";
-    for (char& ch : q) if (ch == '?') ch = ' ';
-    std::vector<std::string> words;
-    { size_t i = 0; while (i < q.size()) { while (i < q.size() && std::isspace(static_cast<unsigned char>(q[i]))) ++i; size_t j = i; while (j < q.size() && !std::isspace(static_cast<unsigned char>(q[j]))) ++j; if (j > i) words.push_back(q.substr(i, j - i)); i = j; } }
-    std::string region = "\x03", nation = "\x03";   // \x03: None (any)
-    for (auto& wd : words) if (t.region_in.count(wd)) { region = wd; break; }
-    for (auto& wd : words) if (t.nation_in.count(wd)) { nation = wd; break; }
-    static const std::map<std::string, std::string> UNIT_ANSWERS = {{"REGULAR", "regular"}, {"ELITE", "elite"}, {"LEADER", "leader"}, {"NAZGUL", "nazgul"}};
-    auto upper = [](std::string x) { for (char& c : x) c = char(std::toupper(static_cast<unsigned char>(c))); return x; };
-    auto answer_text = [](const Value& o) { const Value* a = o.get("answer"); return !a ? std::string() : a->kind == Value::Str ? a->s : a->is_null() ? std::string("None") : a->kind == Value::Int ? std::to_string(a->i) : a->kind == Value::Bool ? std::string(a->b ? "True" : "False") : std::string("?"); };
-    std::vector<const Value*> unit_opts;
-    for (auto* o : opts(dec, "card_choice")) if (UNIT_ANSWERS.count(upper(answer_text(*o)))) unit_opts.push_back(o);
-    if (!unit_opts.empty()) {
-        for (auto* o : unit_opts) {
-            const std::string unit = UNIT_ANSWERS.at(upper(answer_text(*o)));
-            for (auto& e : d.added) {
-                if (e.second > 0 && std::get<2>(e.first) == unit && (region == "\x03" || region == std::get<0>(e.first)) &&
-                    (nation == "\x03" || nation == std::get<1>(e.first))) {
-                    --e.second;
-                    return has_o(o) ? std::optional<int64_t>(at(*o, "o").as_int()) : std::nullopt;
-                }
-            }
-        }
+    if (!work || !work_base || (kind != "CARD_CHOICE" && kind != "ARMY_SELECTION" && kind != "ARMY_MOVE" && kind != "SEPARATE_COMPANIONS"))
         return std::nullopt;
+    if (!diff) diff = ad.board_diff(work_base, work);
+    return ad.diff_pick(dec, *diff, {work, work_card, work_action});
+}
+
+namespace {
+// played_decision(ev): a choice event (a decision the referee made for the bot) as a decision with that one option
+Value played_decision(const Value& ev) {
+    Value o = at(ev, "option");
+    if (o.kind != Value::Obj) { o = Value(); o.kind = Value::Obj; }
+    bool has = false;
+    for (auto& kv : o.obj) if (kv.first == "o") { kv.second = at(ev, "o").is_null() ? I(0) : at(ev, "o"); has = true; }
+    if (!has) o.obj.push_back({"o", at(ev, "o").is_null() ? I(0) : at(ev, "o")});
+    Value opts_; opts_.kind = Value::Arr; opts_.arr.push_back(o);
+    Value ctx; ctx.kind = Value::Obj;
+    Value d; d.kind = Value::Obj;
+    d.obj.push_back({"kind", at(ev, "decision")});
+    d.obj.push_back({"side", at(ev, "side")});
+    d.obj.push_back({"options", opts_});
+    d.obj.push_back({"context", ctx});
+    return d;
+}
+}  // namespace
+
+// _reenter: the engine's action the referee began for the bot (a scenario's played_for_you): the engine's actions at
+// the start position that the played ACTION matches (the search picks among them), then each of the bot's later
+// played answers followed on its copy. Only when the referee's first choice was the bot's ACTION and no other ACTION
+// followed.
+void Bot::reenter(const std::vector<Value>& pre, std::optional<double> left) {
+    const std::string mine = memo.side ? "SHADOW" : "FREE_PEOPLES";
+    if (pre.empty() || !start_view) return;
+    auto str_of = [](const Value& v, const char* k) { const Value& x = at(v, k); return x.kind == Value::Str ? x.s : std::string(); };
+    if (str_of(pre[0], "side") != mine || str_of(pre[0], "decision") != "ACTION") return;
+    for (size_t i = 1; i < pre.size(); ++i) if (str_of(pre[i], "decision") == "ACTION") return;
+    pyobj::Obj* st = ad.build_state(*start_view, memo);
+    const Value fdec = played_decision(pre[0]);
+    const auto su = ad.setup("ACTION", st, fdec, *start_view, memo);
+    if (!su.ported || su.label.empty()) return;
+    const auto r = search_and_map(st, fdec, su.label, su.flag, left);
+    if (!r.first) {
+        if (report) std::fprintf(stderr, "[aw]   %s: the played ACTION matches no engine action (%s)\n", game.c_str(), last.note.c_str());
+        plan.reset(); drop_work();
+        return;
     }
-    int64_t best_s = 0; std::optional<int64_t> best_o; bool found = false;
-    for (auto* o : opts(dec, "card_choice")) {
-        int64_t s = 0;
-        const Value& rv = at(*o, "region");
-        if (!rv.is_null()) {
-            const std::string r = text_of(rv);
-            for (auto& e : d.added) if (std::get<0>(e.first) == r) s += e.second;
-            for (auto& e : d.removed) if (std::get<0>(e.first) == r) s += e.second;
-            for (auto& c : d.chars_to) if (c.first == r) s += 1;
-        }
-        Value fv = at(*o, "from"), tv = at(*o, "to");
-        std::vector<std::string> path;
-        { const std::string a = answer_text(*o); size_t i = 0; while (true) { size_t j = a.find('>', i); path.push_back(a.substr(i, j == std::string::npos ? std::string::npos : j - i)); if (j == std::string::npos) break; i = j + 1; } }
-        if (fv.is_null() && path.size() > 1) { fv = S(path.front()); tv = S(path.back()); }
-        if (!fv.is_null() && !tv.is_null()) {
-            if (any_region(d.removed, text_of(fv), false)) s += 2;
-            if (any_region(d.added, text_of(tv), false)) s += 2;
-            for (size_t i = 1; i + 1 < path.size(); ++i) if (any_region(d.added, path[i], false)) s += 1;
-        }
-        const Value& cv = at(*o, "character");
-        if (!cv.is_null()) {
-            const std::string c = text_of(cv);
-            for (auto& e : d.chars_to) if (e.second == c) s += 2;
-            for (auto& e : d.chars_from) if (e.second == c) s += 1;
-        }
-        if (s > 0 && (!found || s > best_s)) { found = true; best_s = s; best_o = has_o(o) ? std::optional<int64_t>(at(*o, "o").as_int()) : std::nullopt; }
+    for (size_t i = 1; i < pre.size(); ++i) if (str_of(pre[i], "side") == mine) follow(played_decision(pre[i]), left);
+}
+
+// _follow: an answer the referee gave for the bot, followed by its plan or its engine's chain
+void Bot::follow(const Value& dec, std::optional<double> left) {
+    const std::string kind = at(dec, "kind").s;
+    if (plan && plan->takes(kind)) { if (plan->answer(dec)) return; }
+    plan.reset();
+    if (work && CHAIN_KINDS.count(kind)) {
+        if (chain(dec, left)) return;
+        if (diff_answer(dec)) return;
+        if (report) std::fprintf(stderr, "[aw]   %s: the played %s is not the engine's\n", game.c_str(), kind.c_str());
+        return;
     }
-    return found ? best_o : std::nullopt;
+    if (!CHAIN_KINDS.count(kind)) drop_work();
 }
 
 }  // namespace awbot

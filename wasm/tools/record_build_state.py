@@ -298,9 +298,9 @@ def main():
     units_mod.pick = units
     league0 = wpb.LeagueSearcher.choose
 
-    def league(self, st, side, kind, banned, flag=None, left_ms=None):
+    def league(self, st, side, kind, banned, flag=None, left_ms=None, **kw):
         last['stages'] = {}
-        pick, info = league0(self, st, side, kind, banned, flag, left_ms)
+        pick, info = league0(self, st, side, kind, banned, flag, left_ms, **kw)
         stage('pick', pick)
         last['stages']['how'] = info.get('how') if isinstance(info, dict) else None
         return pick, info

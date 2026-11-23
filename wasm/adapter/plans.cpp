@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 using awjson::Value;
 
@@ -171,7 +172,7 @@ Answer CompanionMovePlan::answer(const Value& dec) {
 }
 
 // ---- SeparatePlan ----
-SeparatePlan::SeparatePlan(std::vector<std::string> names, Value to_) : left(std::move(names)), to(std::move(to_)) { kinds = {"SEPARATE_COMPANIONS"}; name = "separate"; }
+SeparatePlan::SeparatePlan(std::vector<std::string> names, Value to_, bool any) : left(std::move(names)), to(std::move(to_)), any_to(any) { kinds = {"SEPARATE_COMPANIONS"}; name = "separate"; }
 Answer SeparatePlan::answer(const Value& dec) {
     for (auto* o : opts(dec, "separate")) {
         const Value& ch = at(*o, "character");
@@ -179,9 +180,63 @@ Answer SeparatePlan::answer(const Value& dec) {
         auto it = std::find(left.begin(), left.end(), ch.s);
         if (it != left.end()) { left.erase(it); return o_of(o); }
     }
-    const auto cand = opts(dec, "separate_to", {to.is_null() ? fnone("to") : f("to", to)});
+    const auto cand = any_to ? opts(dec, "separate_to") : opts(dec, "separate_to", {to.is_null() ? fnone("to") : f("to", to)});
     if (!cand.empty()) return o_of(cand[0]);
     return std::nullopt;
+}
+
+// ---- RageSplitPlan ----
+RageSplitPlan::RageSplitPlan(const Value& split) {
+    kinds = {"CARD_CHOICE", "ARMY_SELECTION"}; name = "rage-split";
+    for (auto [slug, n, e] : {std::tuple<const char*, const char*, const char*>{"north-dunland", "n_north", "n_north_elite"},
+                              {"south-dunland", "n_south", "n_south_elite"}}) {
+        const int64_t units = int_of(split, n, 0);
+        if (units > 0) left.push_back({slug, {units, int_of(split, e, 0)}});
+    }
+}
+Answer RageSplitPlan::answer(const Value& dec) {
+    const Value& c = ctx(dec);
+    auto find = [&](const std::string& r) { for (auto& x : left) if (x.first == r) return &x; return static_cast<std::pair<std::string, std::pair<int64_t, int64_t>>*>(nullptr); };
+    if (at(dec, "kind").s == "CARD_CHOICE") {
+        if (!(at(c, "card").kind == Value::Str && at(c, "card").s == "sh-strat-11")) return std::nullopt;
+        const auto cand = opts(dec, "card_choice");
+        if (cand.empty()) return std::nullopt;
+        for (auto* o : cand) if (!at(*o, "region").truthy() && !at(*o, "skip").truthy()) return std::nullopt;
+        for (auto* o : cand) { const Value& r = at(*o, "region"); if (r.kind == Value::Str && find(r.s)) { current = r.s; return o_of(o); } }
+        return first_of(opts(dec, "card_choice", {f("skip", B(true))}));
+    }
+    const Value& fv = at(c, "from");
+    const std::string frm = fv.truthy() && fv.kind == Value::Str ? fv.s : current;
+    auto* src = find(frm);
+    if (!src) return std::nullopt;
+    const int64_t n = src->second.first, e = src->second.second;
+    const Value* best = nullptr; int64_t bd = 0;
+    for (auto* o : opts(dec, "count")) {
+        const Value& u = at(*o, "unit").truthy() ? at(*o, "unit") : at(c, "unit");
+        const int64_t want = (u.kind == Value::Str && u.s == "elite") ? e : n - e;
+        const int64_t d = std::llabs(int_of(*o, "count", 0) - want);
+        if (!best || d < bd) { best = o; bd = d; }
+    }
+    return best ? o_of(best) : std::nullopt;
+}
+
+// ---- EyeDicePlan ----
+EyeDicePlan::EyeDicePlan(std::vector<std::string> faces_, std::string card_, std::map<int64_t, std::string> face_of_)
+    : faces(std::move(faces_)), card(std::move(card_)), face_of(std::move(face_of_)) { kinds = {"CARD_CHOICE"}; name = "eye-dice"; }
+Answer EyeDicePlan::answer(const Value& dec) {
+    const Value& c = ctx(dec);
+    if (!card.empty() && !(at(c, "card").kind == Value::Str && at(c, "card").s == card)) return std::nullopt;
+    const auto cand = opts(dec, "card_choice");
+    if (cand.empty()) return std::nullopt;
+    for (auto* o : cand) if (at(*o, "count").is_null() && !at(*o, "skip").truthy()) return std::nullopt;
+    for (auto* o : cand) {
+        if (at(*o, "count").is_null()) continue;
+        auto it = face_of.find(at(*o, "count").as_int());
+        if (it == face_of.end()) continue;
+        auto fi = std::find(faces.begin(), faces.end(), it->second);
+        if (fi != faces.end()) { faces.erase(fi); return o_of(o); }
+    }
+    return first_of(opts(dec, "card_choice", {f("skip", B(true))}));
 }
 
 // ---- MinionPlan ----
@@ -279,7 +334,8 @@ Answer rule_card_choice(const Value& dec, const Value& view, int side, bool work
         for (auto* o : chars) if (rank(o) < rank(best)) best = o;
         return o_of(best);
     }
-    const auto draws = opts(dec, "draw");
+    std::vector<const Value*> draws;   // (the official rules' "may draw" also offers declining: always drawn)
+    for (auto* o : opts(dec, "draw")) if (!at(*o, "skip").truthy()) draws.push_back(o);
     if (!draws.empty()) {
         const Value& decks = at(or_empty(or_empty(view, "cards"), "decks"), side == 0 ? "FREE_PEOPLES" : "SHADOW");
         const Value* best = draws[0]; int64_t bn = -1;
@@ -327,6 +383,10 @@ Answer rule(const Tables& t, const std::string& kind, const Value& dec, const Va
     if (kind == "CARD_CHOICE") return rule_card_choice(dec, view, side, work);
     if (kind == "MOVE_MINIONS" || kind == "MOVE_COMPANIONS") return first_of(opts(dec, "end"));
     if (kind == "JOIN_GROUP") return first_of(opts(dec, "stay"));
+    if (kind == "LEADER_REROLL") {   // rule_reroll: the Leader re-roll is taken (the engine always re-rolls)
+        for (auto* o : opts(dec, "card_choice")) if (at(*o, "answer").kind == Value::Str && at(*o, "answer").s == "reroll") return o_of(o);
+        return std::nullopt;
+    }
     if (has_rule) *has_rule = false;
     return std::nullopt;
 }

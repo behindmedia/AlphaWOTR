@@ -62,7 +62,11 @@ public:
     bool has_plan() const { return bool(plan); }
     bool has_work() const { return work != nullptr; }
     void drop_plan() { plan.reset(); }
-    void drop_work() { work = nullptr; work_base = nullptr; diff.reset(); }
+    void drop_work() { work = nullptr; work_base = nullptr; diff.reset(); work_card.clear(); }
+    // the answers of the game so far by how (the Python adapter's Stats: the game-over line on stderr)
+    std::map<std::string, int64_t> hows;
+    // stderr lines: each default answer (kind and why) and each game's how counts (aw-stdio, the worker)
+    bool report = false;
     // the memo's Random set to a state (Python's getstate: 624 words, the index, gauss_next); the harness's resync
     void set_memo_rng(const std::vector<uint32_t>& words, uint32_t index, bool has_gauss, double gauss);
 
@@ -74,6 +78,7 @@ private:
     awad::Memo memo;
     bool in_game = false;
     std::string clock_kind;
+    std::string game;                  // the game's id (the stderr lines)
     // the answer's deadline on a per-decision clock (AlphaWotrBot._deadline: the decide's arrival + the clock less
     // MARGIN_MS); none on other clocks
     std::optional<std::chrono::steady_clock::time_point> answer_deadline;
@@ -81,15 +86,14 @@ private:
     pyobj::Obj* work = nullptr;        // the engine's state of an ongoing chain
     pyobj::Obj* work_base = nullptr;   // ... and the state it started from
     std::string work_action;
+    std::string work_card;             // the card the engine's action plays ('' none): its questions follow
+    // a game from a position (the certification's scenarios): its view, and the choices the referee made before the
+    // first question (played for the bot: its own card play under way, reenter)
+    std::optional<awjson::Value> start_view;
+    std::optional<std::vector<awjson::Value>> prefix;
     void* own_rng = nullptr;           // the bot's global stream (no harness)
     uint64_t own_seed = 0;
-    using Key = std::tuple<std::string, std::string, std::string>;   // (region slug, nation, unit); "\x01" none
-    // diff_answer's board difference
-    struct Diff {
-        std::vector<std::pair<Key, int64_t>> added, removed;
-        std::set<std::pair<std::string, std::string>> chars_to, chars_from, moves_done;
-    };
-    std::optional<Diff> diff;
+    std::optional<awad::Diff> diff;    // diff_answer's board difference
 
     std::string decide(const awjson::Value& m);
     std::pair<std::optional<int64_t>, std::string> decide_(const awjson::Value& dec, const awjson::Value& view, std::optional<double> left);
@@ -102,7 +106,9 @@ private:
     bool chain_fits(pyobj::Obj* w, const awjson::Value& dec, const Menu& mn);
     bool chain_over(pyobj::Obj* w, const std::string& kind);
     std::optional<int64_t> diff_answer(const awjson::Value& dec);
-    void figure_counts(pyobj::Obj* st, std::vector<std::pair<Key, int64_t>>& out, std::set<std::pair<std::string, std::string>>& chars);
+    // _reenter / _follow: the engine's action the referee began for the bot, and its later played answers
+    void reenter(const std::vector<awjson::Value>& pre, std::optional<double> left);
+    void follow(const awjson::Value& dec, std::optional<double> left);
 };
 
 }  // namespace awbot

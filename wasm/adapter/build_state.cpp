@@ -664,7 +664,99 @@ Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value
             }
         }
     }
-    const auto draws = opts(dec, "draw");
+    std::vector<const Value*> payers;
+    for (const Value* o : counts) if (at(*o, "character").truthy()) payers.push_back(o);
+    // Mighty Attack's payer (the official rules ask it; the engine's round cursor asks it as a combat_effect_choice
+    // target and its AI menu keeps one: ai_policies._mighty_payer_priority). The cards whose combat_name is Mighty
+    // Attack (cards.py): Axe and Bow, Horn of Gondor.
+    const std::string ckey = at(ctx, "card").kind == Value::Str ? at(ctx, "card").s : "";
+    if (b.truthy() && !payers.empty() && !card.empty() && (ckey == "fp-char-06" || ckey == "fp-char-07")) {
+        const int64_t o = mighty_payer(st, b, payers);
+        if (o >= 0) { r.has_match = true; r.match = o; return r; }
+    }
+    const std::string question_s = at(ctx, "question").kind == Value::Str ? at(ctx, "question").s : "";
+    if (me == 0 && ckey == "sh-strat-06" && question_s == "Eliminate which figure?") {
+        // Stormcrow's piece, the Free Peoples' choice (event_effects._effect_stormcrow's stage 2): {'eliminate':
+        // {nation, kind, region}}, the nation read off the view
+        static const std::set<std::string> FPN = {"DWARVES", "ELVES", "GONDOR", "NORTH", "ROHAN"};
+        const Value& vr = or_empty(view, "regions");
+        Obj* choices = m.list();
+        for (const Value* o : counts) {
+            const std::string rg = at(*o, "region").kind == Value::Str ? at(*o, "region").s : "";
+            const std::string unit = lower(at(*o, "unit").kind == Value::Str ? at(*o, "unit").s : "");
+            std::string nat;
+            const Value* rv = rg.empty() ? nullptr : vr.get(rg);
+            for (const Value& u : (rv ? or_empty(*rv, "units") : NULL_VALUE).arr)
+                if (at(u, "unit").kind == Value::Str && at(u, "unit").s == unit && at(u, "nation").kind == Value::Str && FPN.count(at(u, "nation").s)) { nat = at(u, "nation").s; break; }
+            if (nat.empty()) { r.label = ""; return r; }
+            Obj* e = m.dict();
+            m.dict_set(e, m.str("nation"), m.str(lower(nat)));
+            m.dict_set(e, m.str("kind"), m.str(unit));
+            auto ri = t.region_in.find(rg);
+            m.dict_set(e, m.str("region"), ri == t.region_in.end() ? m.none() : m.str(ri->second));
+            Obj* d = m.dict(); m.dict_set(d, m.str("eliminate"), e);
+            choices->k.push_back(d);
+        }
+        Obj* opt = m.dict();
+        auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+        const std::string sc = t.card("sh-strat-06");
+        put("card_id", m.str(sc.empty() ? "Stormcrow" : sc)); put("card_name", m.str("Stormcrow")); put("side", m.str("sh"));
+        put("decider", m.str("fp")); put("direct", m.boolean(true)); put("options", choices);
+        m.set_attr(st, "pending_card_option", opt);
+        r.label = "action"; return r;
+    }
+    if (me == 0 && question_s == "Play another Character card?") {
+        // The Ents Awake's free Character card (event_effects._effect_ents_awake_common): {'ents_chain_play': card}
+        // or {'_ents_chain_done': True}
+        Obj* chain = m.list();
+        for (const Value* o : counts) {
+            if (at(*o, "skip").truthy()) continue;
+            const Value& tc = at(*o, "target_card");
+            const std::string cid = tc.kind == Value::Str ? t.card(tc.s) : "";
+            if (cid.empty()) continue;
+            Obj* d = m.dict(); m.dict_set(d, m.str("ents_chain_play"), m.str(cid)); chain->k.push_back(d);
+        }
+        Obj* done = m.dict(); m.dict_set(done, m.str("_ents_chain_done"), m.boolean(true)); chain->k.push_back(done);
+        const std::string title = !card.empty() && t.card_title.count(card) ? t.card_title.at(card) : "The Ents Awake: Treebeard";
+        Obj* opt = m.dict();
+        auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+        put("card_id", m.str(card.empty() ? title : card)); put("card_name", m.str(title)); put("side", m.str("fp"));
+        put("decider", m.str("fp")); put("direct", m.boolean(true)); put("options", chain);
+        m.set_attr(st, "pending_card_option", opt);
+        r.label = "action"; return r;
+    }
+    if (me == 0 && ckey == "fp-strat-06" && question_s == "Recruit which Gondor unit?") {
+        // Faramir's Rangers' recruitment in Osgiliath after the strike (event_effects._faramir_recruit_options: the
+        // engine's own pending {'_far_recruit': True, 'unit_type': kind}, a kind for each the reinforcements hold,
+        // when a Free Peoples Army is in Osgiliath); asked here when the engine's copy rolled other dice
+        static const std::set<std::string> FPN = {"DWARVES", "ELVES", "GONDOR", "NORTH", "ROHAN"};
+        bool fp_army = false;
+        const Value* osg = or_empty(view, "regions").get("osgiliath");
+        for (const Value& u : (osg ? or_empty(*osg, "units") : NULL_VALUE).arr)
+            if (at(u, "nation").kind == Value::Str && FPN.count(at(u, "nation").s) && at(u, "unit").kind == Value::Str &&
+                (at(u, "unit").s == "regular" || at(u, "unit").s == "elite")) fp_army = true;
+        if (fp_army) {
+            const Value& gr = at(or_empty(view, "reinforcements"), "GONDOR");
+            Obj* options = m.list();
+            for (const char* kind : {"regular", "elite"}) {
+                const Value* n = gr.kind == Value::Obj ? gr.get(kind) : nullptr;
+                if (!n || n->as_int() <= 0) continue;
+                Obj* d = m.dict(); m.dict_set(d, m.str("_far_recruit"), m.boolean(true)); m.dict_set(d, m.str("unit_type"), m.str(kind));
+                options->k.push_back(d);
+            }
+            if (options->k.empty()) { Obj* d = m.dict(); m.dict_set(d, m.str("_far_recruit"), m.boolean(true)); options->k.push_back(d); }
+            const std::string fc = t.card("fp-strat-06");
+            Obj* opt = m.dict();
+            auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+            put("card_id", m.str(fc.empty() ? "FREE_PEOPLES_Strategy_Faramir's_Rangers" : fc)); put("card_name", m.str("Faramir's Rangers"));
+            put("side", m.str("fp")); put("decider", m.str("fp")); put("direct", m.boolean(true)); put("faramir_recruit", m.boolean(true));
+            put("options", options);
+            m.set_attr(st, "pending_card_option", opt);
+            r.label = "action"; return r;
+        }
+    }
+    std::vector<const Value*> draws;   // (the official rules' "may draw" also offers declining: skip, no deck)
+    for (const Value* o : opts(dec, "draw")) if (!at(*o, "skip").truthy()) draws.push_back(o);
     if (!draws.empty() && me == 1) {   // the Palantir of Orthanc's bonus draw (ai._open_palantir_deck_choice)
         Obj* opt = m.dict();
         auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
@@ -703,6 +795,31 @@ Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value
         }
     }
     r.label = ""; return r;                                    // None: no engine decision
+}
+
+// mighty_payer: ai_policies._mighty_payer_priority over the engine's Companions in the battle (the lowest Leadership,
+// Aragorn last, then the name), among the referee's options; -1 none
+int64_t Adapter::mighty_payer(Obj* st, const Value& b, const std::vector<const Value*>& payers) {
+    using M = pyobj::Model;
+    std::map<std::string, Obj*> by_name;
+    for (const char* k : {"region", "from"}) {
+        const Value& sl = at(b, k);
+        auto ri = sl.kind == Value::Str ? t.region_in.find(sl.s) : t.region_in.end();
+        Obj* army = ri == t.region_in.end() ? nullptr : army_at(st, ri->second);
+        if (!army) continue;
+        for (Obj* ld : M::attr(army, "leaders")->k) if (M::type(ld) == "game_state.Companion") by_name.emplace(M::attr(ld, "name")->s, ld);
+    }
+    std::tuple<int64_t, bool, std::string, size_t> best; int64_t best_o = -1; bool have = false;
+    for (size_t i = 0; i < payers.size(); ++i) {
+        const Value& ck = at(*payers[i], "character");
+        Obj* fig = ck.kind == Value::Str ? character_figure(ck.s, by_name) : nullptr;
+        if (!fig || at(*payers[i], "o").kind == Value::Null) return -1;
+        std::string name = lower(M::attr(fig, "name")->s);
+        while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back()))) name.pop_back();
+        const auto key = std::make_tuple(M::attr(fig, "leadership")->i, name == "aragorn", name, i);
+        if (!have || key < best) { best = key; best_o = at(*payers[i], "o").as_int(); have = true; }
+    }
+    return best_o;
 }
 
 // game_logic.fellowship_region: the Fellowship's region key, sanitised

@@ -64,7 +64,24 @@ struct CompanionMovePlan : Plan {
 struct SeparatePlan : Plan {
     std::vector<std::string> left;
     awjson::Value to;
-    SeparatePlan(std::vector<std::string> names, awjson::Value to_);
+    bool any_to = false;   // to None: any (the Fellowship on the Mordor Track: the engine removes them from play)
+    SeparatePlan(std::vector<std::string> names, awjson::Value to_, bool any = false);
+    Answer answer(const awjson::Value& dec) override;
+};
+// Rage of the Dunlendings' move (the engine's split {n_north, n_south, n_north_elite, n_south_elite}): the
+// referee's "Move Isengard units from Dunland?" per source region (or skip), then maybe how many of each unit
+struct RageSplitPlan : Plan {
+    std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> left;   // source slug -> (units, Elites)
+    std::string current;
+    explicit RageSplitPlan(const awjson::Value& split);
+    Answer answer(const awjson::Value& dec) override;
+};
+// The Lidless Eye ({dice_count, dice_faces}): the referee asks die by die (the answer's count the die's index)
+struct EyeDicePlan : Plan {
+    std::vector<std::string> faces;            // the faces still to turn (ActionDieFace members)
+    std::string card;                           // the protocol key of the card asking ('' any)
+    std::map<int64_t, std::string> face_of;     // an unused die's index -> its face
+    EyeDicePlan(std::vector<std::string> faces_, std::string card_, std::map<int64_t, std::string> face_of_);
     Answer answer(const awjson::Value& dec) override;
 };
 struct MinionPlan : Plan {

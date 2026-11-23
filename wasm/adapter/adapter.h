@@ -6,6 +6,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 #include "json.h"
 #include "pyobj.h"
@@ -14,6 +15,16 @@ std::string awad_sanitize(const std::string& name);   // board.sanitize (the box
 
 namespace awad {
 struct Plan;
+
+// diff_answer's board difference (protocol/wotr_protocol_bot.py board_diff): the figures the engine's action added
+// and removed {(region slug, nation, unit): n} (in the map's order), the Characters that came and went, and what the
+// answers took off it (diff_pick: the Army moves answered, the Companions separated)
+using DiffKey = std::tuple<std::string, std::string, std::string>;   // (region slug, nation, unit); "\x01" none
+struct Diff {
+    std::vector<std::pair<DiffKey, int64_t>> added, removed;
+    std::set<std::pair<std::string, std::string>> chars_to, chars_from, moves_done;
+    std::vector<std::string> separated;
+};
 
 // The adapter's name tables (Names), from wasm/tools/record_build_state.py's adapter.json
 struct Tables {
@@ -54,12 +65,16 @@ public:
     Setup setup(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
     // an engine row of the box's menu: die, action type, parameters (an Enum as "\x01enum:MEMBER")
     // menu, index: the box's menu snapshot and the row's index in it (the plans that apply the action on a copy)
-    struct Row { int64_t die = -1; std::string type; awjson::Value params; const void* menu = nullptr; int64_t index = -1; };
+    struct Row { int64_t die = -1; std::string type; awjson::Value params; const void* menu = nullptr; int64_t index = -1;
+                 const void* sn = nullptr; };   // sn: the menu's state as a snapshot (none: encoded from st when needed)
     const void* obs_tables = nullptr;   // the box's prepared observation tables (for the plans that apply an action)
     // map_action's Match: ok (an option matched; o_none: its 'o' is None), has_plan, chain; unported: not yet
     // make_plan: the plan (Match.plan(), made once, may be none); resolve: Match.option()'s final option given it
     struct Matched {
         bool ok = false, o_none = false, has_plan = false, chain = false, unported = false; int64_t o = -1;
+        // the board this action makes, as its first answer read it (m_card_choice's recruit_counts: Match.diff); the
+        // chain goes on reading it
+        std::shared_ptr<Diff> diff;
         std::function<std::shared_ptr<Plan>()> make_plan;
         std::function<std::optional<int64_t>(Plan*)> resolve;
         std::shared_ptr<Plan> plan() { if (!made && make_plan) { cached = make_plan(); } made = true; return cached; }
@@ -76,6 +91,18 @@ public:
     // figures(st, key, side): {(nation, unit): n} and the Character keys of `side` in a region
     struct Figures { std::map<std::pair<std::string, std::string>, int64_t> units; std::set<std::string> chars; };
     Figures figures(pyobj::Obj* st, const std::string& key, int side);
+    // figure_counts(st, names) and board_diff(bot, before, after)
+    void figure_counts(pyobj::Obj* st, std::vector<std::pair<DiffKey, int64_t>>& out, std::set<std::pair<std::string, std::string>>& chars);
+    Diff board_diff(pyobj::Obj* before, pyobj::Obj* after);
+    // diff_pick(bot, dec, diff): the answer read off a board diff (consumed as it answers); work: the engine's chain
+    // copy (null none), work_card: the card its action plays ('' none), work_action: its action type
+    struct PickCtx { pyobj::Obj* work = nullptr; std::string work_card, work_action; };
+    std::optional<int64_t> diff_pick(const awjson::Value& dec, Diff& d, const PickCtx& c);
+    // question_region(bot, question): the protocol key of the region the question names at its end ('' none)
+    std::string question_region(const awjson::Value& question) const;
+    // the engine's row applied on a copy of st (a stream of its own: the actions applied here draw nothing); null:
+    // the engine refused it
+    pyobj::Obj* apply_row(pyobj::Obj* st, const Row& a, int side);
 
 private:
     pyobj::Model& m;
@@ -108,6 +135,9 @@ private:
     void choice_tokens(const awjson::Value& v, std::set<std::pair<std::string, std::string>>& out);
     int64_t score_options(const awjson::Value& dec, const std::set<std::pair<std::string, std::string>>& toks, bool empty);
     Setup setup_card_choice(pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
+    Matched companion_action_match(const awjson::Value& dec, const awjson::Value& ch);
+    // mighty_payer: the Companion the engine's AI menu has pay Mighty Attack's Leadership (none: -1)
+    int64_t mighty_payer(pyobj::Obj* st, const awjson::Value& b, const std::vector<const awjson::Value*>& payers);
 };
 
 }  // namespace awad
