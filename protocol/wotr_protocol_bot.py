@@ -1405,10 +1405,93 @@ class SeparatePlan(Plan):
             if o.get('character') in self.left:
                 self.left.remove(o['character'])
                 return o['o']
-        cand = opts(dec, 'separate_to', to=self.to)
+        # (to None: any; the Fellowship on the Mordor Track, where the
+        # engine removes them from play and the referee's one destination
+        # eliminates them)
+        cand = opts(dec, 'separate_to', to=self.to) if self.to is not None \
+            else opts(dec, 'separate_to')
         if cand:
             return cand[0]['o']
         return None
+
+
+class RageSplitPlan(Plan):
+    """Rage of the Dunlendings' move (the engine's one split, {'rage_split':
+    {n_north, n_south, n_north_elite, n_south_elite}}): the referee asks
+    "Move Isengard units from Dunland?" per source region (or skip), then
+    maybe how many of each unit."""
+    kinds = ('CARD_CHOICE', 'ARMY_SELECTION')
+    name = 'rage-split'
+    CARD = 'sh-strat-11'
+
+    def __init__(self, split):
+        self.left = {}
+        for slug, n, e in (('north-dunland', 'n_north', 'n_north_elite'),
+                           ('south-dunland', 'n_south', 'n_south_elite')):
+            if int(split.get(n) or 0) > 0:
+                self.left[slug] = (int(split[n]), int(split.get(e) or 0))
+        self.current = None
+
+    def answer(self, dec):
+        ctx = dec.get('context') or {}
+        if dec['kind'] == 'CARD_CHOICE':
+            if str(ctx.get('card', '')) != self.CARD:
+                return None
+            cand = opts(dec, 'card_choice')
+            if not cand or not all(o.get('region') or o.get('skip') for o in cand):
+                return None
+            for o in cand:
+                if o.get('region') in self.left:
+                    self.current = o['region']
+                    return o['o']
+            return first(opts(dec, 'card_choice', skip=True))
+        frm = ctx.get('from') or self.current
+        if frm not in self.left:
+            return None
+        n, e = self.left[frm]
+        best = None
+        for o in opts(dec, 'count'):
+            unit = o.get('unit') or ctx.get('unit')
+            want = e if unit == 'elite' else n - e
+            d = abs(int(o.get('count', 0)) - want)
+            if best is None or d < best[0]:
+                best = (d, o['o'])
+        return best[1] if best else None
+
+
+class EyeDicePlan(Plan):
+    """The Lidless Eye (the engine's one option: {'dice_count': n,
+    'dice_faces': [face, ...]}, the faces of the dice turned to Eyes):
+    the referee asks die by die ("Which die becomes an Eye?", the answer's
+    count the die's index, as use_die's die), then skip."""
+    kinds = ('CARD_CHOICE',)
+    name = 'eye-dice'
+
+    def __init__(self, bot, st, faces, card):
+        me = bot.memo.side
+        self.faces = [str(f) for f in faces or []]
+        self.card = card
+        self.face_of = {}
+        for i, d in enumerate(st.dice.get(me) or []):
+            if not d.used and d.current is not None:
+                self.face_of[i] = d.current.name
+
+    def answer(self, dec):
+        ctx = dec.get('context') or {}
+        if self.card is not None and ctx.get('card') != self.card:
+            return None
+        cand = opts(dec, 'card_choice')
+        if not cand or not all(o.get('count') is not None or o.get('skip')
+                               for o in cand):
+            return None
+        for o in cand:
+            if o.get('count') is None:
+                continue
+            f = self.face_of.get(int(o['count']))
+            if f in self.faces:
+                self.faces.remove(f)
+                return o['o']
+        return first(opts(dec, 'card_choice', skip=True))
 
 
 class MinionPlan(Plan):
@@ -1622,6 +1705,11 @@ class AlphaWotrBot(object):
         self.work = None           # the engine's state of an ongoing chain
         self.work_base = None      # ... and the state it started from
         self.diff = None
+        # a game from a position (the certification's scenarios): its
+        # view, and the choices the referee made before the first question
+        # (played for the bot: its own card play under way, _reenter)
+        self.start_view = None
+        self.prefix = None
         self.match_stats = Stats()
         self.stats = None
         self.options = {}
@@ -1669,7 +1757,14 @@ class AlphaWotrBot(object):
             self.game = m.get('game')
             self.plan = None
             self.work = None
+            self.work_base = None
+            self.diff = None
             self.stats = Stats()
+            self.start_view = None
+            self.prefix = None
+            if m.get('start') == 'position' and m.get('played_for_you'):
+                self.start_view = m.get('view')
+                self.prefix = []
             # (an online game taken up again after a dropped connection is
             # a new_game with the same id and every event from the start:
             # the memo is simply built again)
@@ -1679,8 +1774,11 @@ class AlphaWotrBot(object):
                 json.dumps(m.get('clock'))))
             return {'type': 'ready', 'id': m.get('id')}
         if t == 'event':
+            ev = m.get('event') or {}
             if self.memo is not None:
-                self.memo.event(m.get('event') or {})
+                self.memo.event(ev)
+            if self.prefix is not None and ev.get('kind') == 'choice':
+                self.prefix.append(ev)
             return None
         if t == 'decide':
             return self.decide(m)
@@ -1789,6 +1887,24 @@ class AlphaWotrBot(object):
     def _decide(self, dec, view, left):
         kind = dec['kind']
         options = dec.get('options') or []
+        if self.prefix is not None:
+            # the first question of a game from a position: the referee
+            # may have begun the bot's own action for it
+            pre, self.prefix = self.prefix, None
+            if kind in CHAIN_KINDS:
+                # (half the clock: the question itself has the rest)
+                dl = self.searcher.deadline
+                if dl is not None:
+                    now = time.monotonic()
+                    self.searcher.deadline = now + max(0.0, dl - now) / 2.0
+                try:
+                    self._reenter(pre, None if left is None else left / 2.0)
+                except Exception as e:
+                    log('! %s: re-entering the played action: %s: %s' % (
+                        self.game, type(e).__name__, e))
+                    self.plan = self.work = self.work_base = self.diff = None
+                finally:
+                    self.searcher.deadline = dl
         if len(options) == 1:
             self._continue_plan_quietly(dec)
             return options[0]['o'], 'only', {}
@@ -1837,6 +1953,56 @@ class AlphaWotrBot(object):
             return ready.o, 'rule', {'note': 'engine rule'}
         label, flag = ready
         return self._search_and_map(st, dec, label, flag, left)
+
+    def _reenter(self, pre, left):
+        """The engine's action the referee began for the bot (a scenario's
+        played_for_you: the bot's die and card, and maybe the card's first
+        answers): the engine's actions at the start position that the
+        played ACTION matches (the search picks among them), then each of
+        the bot's later played answers followed on its copy, as if it had
+        answered them itself.  Only when the referee's first choice was the
+        bot's ACTION and no other ACTION followed (the start view is then
+        the state that action was chosen in)."""
+        mine = side_out(self.memo.side)
+        if not pre or self.start_view is None:
+            return
+        if pre[0].get('side') != mine or pre[0].get('decision') != 'ACTION':
+            return
+        if any(e.get('decision') == 'ACTION' for e in pre[1:]):
+            return
+        st = build_state(self.start_view, self.memo, self.names)
+        ev = pre[0]
+        fdec = played_decision(ev)
+        ready = setup_action(self, st, fdec, self.start_view)
+        label, flag = ready
+        o, how, info = self._search_and_map(st, fdec, label, flag, left)
+        if o is None:
+            log('  %s: the played %s matches no engine action (%s)' % (
+                self.game, json.dumps(ev.get('option')), info.get('note')))
+            self.plan = self.work = self.work_base = self.diff = None
+            return
+        for ev in pre[1:]:
+            if ev.get('side') == mine:
+                self._follow(played_decision(ev), left)
+
+    def _follow(self, dec, left):
+        """An answer the referee gave for the bot, followed by its plan or
+        its engine's chain as _decide would have answered it."""
+        kind = dec['kind']
+        if self.plan is not None and kind in self.plan.kinds:
+            if self.plan.answer(dec) is not None:
+                return
+        self.plan = None
+        if self.work is not None and kind in CHAIN_KINDS:
+            if self._chain(dec, None, left) is not None:
+                return
+            if diff_answer(self, dec) is not None:
+                return
+            log('  %s: the played %s %s is not the engine\'s' % (
+                self.game, kind, json.dumps(dec['options'][0])))
+            return
+        if kind not in CHAIN_KINDS:
+            self.work = self.work_base = self.diff = None
 
     def _decision_ms(self, clock):
         """The clock the search may use for this decision, as a time per
@@ -1954,6 +2120,9 @@ class AlphaWotrBot(object):
             self.work = self._apply_copy(st, a, flag)
             self.work_base = st
             self.work_action = a.action_type
+            # the card the engine's action plays (its questions follow)
+            self.work_card = self.names.card_key((a.params or {}).get(
+                'card_id')) if a.action_type == 'play_event' else None
             self.diff = None
         return o, 'search' if 'sims' in info else 'single', info
 
@@ -2013,6 +2182,11 @@ class AlphaWotrBot(object):
         o = mt.option()
         self.plan = mt.plan()
         self.work = self._apply_copy(w, a)
+        if getattr(mt, 'diff', None) is not None:
+            # the link's board diff, as its first answer read it (the
+            # questions that follow go on reading it: diff_answer)
+            self.work_base = w
+            self.diff = mt.diff
         return o, 'chain', info
 
     # -- the engine's action -> the referee's option -------------------
@@ -2025,6 +2199,15 @@ class AlphaWotrBot(object):
 
     def slug(self, key):
         return self.names.slug(key)
+
+
+def played_decision(ev):
+    """A choice event (a decision the referee made for the bot) as a
+    decision with that one option."""
+    o = dict(ev.get('option') or {})
+    o['o'] = ev.get('o', 0)
+    return {'kind': ev.get('decision'), 'side': ev.get('side'),
+            'options': [o], 'context': {}}
 
 
 def chain_over(w, kind):
@@ -2437,7 +2620,56 @@ def setup_card_choice(bot, st, dec, view):
                     'max_count': max(int(o['count']) for o in counts)}
                 pc[role + '_combat_card'] = card
                 return ('action', None)
-    draws = opts(dec, 'draw')
+    payers = [o for o in counts if o.get('character')]
+    if b and payers and card and plain(getattr(cards_mod.get_card(card),
+                                              'combat_name', '') or '') == 'mightyattack':
+        # Mighty Attack's payer (the official rules ask it; the engine's
+        # round cursor asks it as a combat_effect_choice target, and its
+        # AI menu keeps one: ai_policies._mighty_payer_priority, the
+        # lowest Leadership)
+        o = mighty_payer(bot, st, b, payers)
+        if o is not None:
+            return Match(o)
+    # the decks (the official rules' "may draw" also offers declining: skip,
+    # no deck; the engine always draws)
+    if me is FP and str(ctx.get('card', '')) == 'sh-strat-06' and \
+            str(ctx.get('question', '')) == 'Eliminate which figure?':
+        # Stormcrow's piece, the Free Peoples' choice (event_effects.
+        # _effect_stormcrow's stage 2): {'eliminate': {nation, kind,
+        # region}}, the nation read off the view
+        regions = view.get('regions') or {}
+        choices = []
+        for o in opts(dec, 'card_choice'):
+            r, unit = o.get('region'), str(o.get('unit') or '').lower()
+            nat = next((u.get('nation') for u in (regions.get(r) or {}).get('units') or []
+                        if u.get('unit') == unit and u.get('nation') in (
+                            'DWARVES', 'ELVES', 'GONDOR', 'NORTH', 'ROHAN')), None)
+            if nat is None:
+                return None
+            choices.append({'eliminate': {'nation': nat.lower(), 'kind': unit,
+                                          'region': bot.names.region(r)}})
+        st.pending_card_option = {
+            'card_id': bot.names.card('sh-strat-06') or 'Stormcrow',
+            'card_name': 'Stormcrow', 'side': 'sh', 'decider': 'fp',
+            'direct': True, 'options': choices}
+        return ('action', None)
+    if me is FP and str(ctx.get('question', '')) == 'Play another Character card?':
+        # The Ents Awake's free Character card (event_effects.
+        # _effect_ents_awake_common): the engine's own chain question,
+        # {'ents_chain_play': card} or {'_ents_chain_done': True}
+        cid = bot.names.card(ctx.get('card'))
+        chain = []
+        for o in opts(dec, 'card_choice'):
+            c = None if o.get('skip') else bot.names.card(o.get('target_card'))
+            if c is not None:
+                chain.append({'ents_chain_play': c})
+        title = cards_mod.get_card(cid).card_name if cid else 'The Ents Awake: Treebeard'
+        st.pending_card_option = {
+            'card_id': cid or title, 'card_name': title, 'side': 'fp',
+            'decider': 'fp', 'direct': True,
+            'options': chain + [{'_ents_chain_done': True}]}
+        return ('action', None)
+    draws = [o for o in opts(dec, 'draw') if not o.get('skip')]
     if draws and me is SH:
         # the Palantir of Orthanc's bonus draw (ai._open_palantir_deck_choice)
         st.pending_card_option = {
@@ -2463,6 +2695,39 @@ def setup_card_choice(bot, st, dec, view):
                                 {'use_hunt_reduction': 0}]}
                 return ('action', None)
     return None
+
+
+def mighty_payer(bot, st, b, payers):
+    """The Companion the engine's AI menu has pay Mighty Attack's
+    Leadership, among the referee's options: ai_policies.
+    _mighty_payer_priority over the engine's figures in the battle."""
+    import ai_policies
+    from types import SimpleNamespace
+    by_name = {}
+    for k in (bot.names.region(b.get('region')), bot.names.region(b.get('from'))):
+        army = army_at(st, k) if k is not None else None
+        for ld in (army.leaders if army else []):
+            if isinstance(ld, gs.Companion):
+                by_name.setdefault(ld.name, ld)
+    figs, acts, back = [], [], {}
+    for o in payers:
+        fig = character_figure(o['character'], by_name)
+        if fig is None:
+            return None
+        figs.append(fig)
+        back[fig.name] = o['o']
+        acts.append(ai.Action(die_idx=-1, action_type='combat_effect_choice',
+                              params={'card_id': 'Mighty Attack',
+                                      'target': fig.name}))
+    cursor = SimpleNamespace(combat=SimpleNamespace(companions_in_battle=figs))
+    fake = SimpleNamespace(pending_combat={
+        'phase': 'combat_effect_choice',
+        'effect_choice': {'effect': 'mighty_attack'},
+        '_round_resume': {'cursor': cursor}})
+    i = ai_policies._mighty_payer_priority(fake, acts)
+    if i is None:
+        return None
+    return back.get(acts[i].params['target'])
 
 
 SETUPS = {
@@ -2935,6 +3200,19 @@ def m_card_choice(bot, st, dec, a):
         ch = (a.params or {}).get('choices') or {}
         if 'palantir_deck' in ch:
             return _m(opts(dec, 'draw', deck=ch['palantir_deck']))
+        if 'eliminate' in ch:
+            e = ch['eliminate'] or {}
+            return _m([o for o in opts(dec, 'card_choice')
+                       if str(o.get('unit', '')).lower() == e.get('kind')
+                       and o.get('region') == bot.names.slug(e.get('region'))])
+        if 'ents_chain_play' in ch:
+            # (a chain: the card played next asks its own questions, on
+            # the engine's copy where it is played)
+            return _m([o for o in opts(dec, 'card_choice')
+                       if not o.get('skip') and bot.names.card(o.get('target_card')) == ch['ents_chain_play']],
+                      chain=True)
+        if ch.get('_ents_chain_done'):
+            return _m(opts(dec, 'card_choice', skip=True))
         if 'use_hunt_reduction' in ch:
             if ch['use_hunt_reduction']:
                 return _m([o for o in opts(dec, 'card_choice')
@@ -2943,6 +3221,35 @@ def m_card_choice(bot, st, dec, a):
         if ch.get('_comp_done') or ch.get('_naz_done'):
             o = first(opts(dec, 'end')) or first(opts(dec, 'card_choice', skip=True))
             return Match(o, chain=True) if o is not None else None
+        if ch.get('companion_action') is not None:
+            return companion_action_match(bot, dec, ch)
+        if 'recruit_counts' in ch:
+            # a recruitment card's allocation (Many Kings, Pits of Mordor,
+            # Orcs Multiplying Again, A New Power is Rising ... when the
+            # Regulars run short): the referee asks region by region or
+            # figure by figure; answered off the board this option makes
+            # (A New Power is Rising adds its Orthanc Elites by itself)
+            w = deep_copy_state(st)
+            try:
+                ai._execute_action(w, a)
+            except Exception:
+                return None
+            diff = board_diff(bot, st, w)
+            o = diff_pick(bot, dec, diff)
+            if o is None:
+                return None
+            m = Match(o, chain=True)
+            m.diff = diff
+            return m
+        if 'dice_faces' in ch:
+            plan = EyeDicePlan(bot, st, ch['dice_faces'],
+                               bot.names.card_key(a.params.get('card_id')))
+            o = plan.answer(dec)
+            return Match(o, plan, chain=True) if o is not None else None
+        if isinstance(ch.get('rage_split'), dict):
+            plan = RageSplitPlan(ch['rage_split'])
+            o = plan.answer(dec)
+            return Match(o, plan, chain=True) if o is not None else None
         toks = set()
         choice_tokens(bot, ch, toks)
         best = score_options(dec, toks, not ch)
@@ -2970,6 +3277,41 @@ def m_card_choice(bot, st, dec, a):
             return Match(cand[0]['o'], plan, chain=True)
         return None
     return None
+
+
+def companion_action_match(bot, dec, ch):
+    """Gwaihir the Windlord, We Prove Swifter: the engine's one option
+    names the action and the destination ({'companion_action': 'sep_<name>'
+    or 'group' + 'companions', or 'move_<name>' or 'move_group' +
+    'companions'; 'destination'}); the referee asks "Separate" or the
+    Companion moving first, then the Companions one by one (separate,
+    join) and the destination."""
+    ca = str(ch.get('companion_action'))
+    dest = bot.names.slug(ch.get('destination'))
+    if dest is None:
+        return None
+    if ca in ('group', 'move_group'):
+        who = list(ch.get('companions') or [])
+    elif ca.startswith('sep_') or ca.startswith('move_'):
+        who = [ca.split('_', 1)[1]]
+    else:
+        return None
+    keys = [CHAR_OUT.get(n) for n in who]
+    if not keys or None in keys:
+        return None
+    if ca == 'group' or ca.startswith('sep_'):
+        o = first([o for o in opts(dec, 'card_choice')
+                   if str(o.get('answer', '')).lower() == 'separate'])
+        if o is None:
+            return None
+        return Match(o, SeparatePlan(keys, dest), chain=True)
+    cand = [o for o in opts(dec, 'move_companion')
+            if o.get('character') in keys and o.get('to') == dest]
+    if not cand:
+        return None
+    plan = CompanionMovePlan(keys, cand[0].get('from'), dest)
+    plan.started = True
+    return Match(cand[0]['o'], plan, chain=True)
 
 
 def score_options(dec, toks, empty):
@@ -3026,22 +3368,51 @@ def diff_answer(bot, dec):
     whose words match its board after the action (figures added or
     removed, a region changed)."""
     if bot.work is None or bot.work_base is None or dec['kind'] not in (
-            'CARD_CHOICE', 'ARMY_SELECTION', 'ARMY_MOVE'):
+            'CARD_CHOICE', 'ARMY_SELECTION', 'ARMY_MOVE',
+            'SEPARATE_COMPANIONS'):
         return None
     if bot.diff is None:
-        b, bc = figure_counts(bot.work_base, bot.names)
-        w, wc = figure_counts(bot.work, bot.names)
-        added, removed = {}, {}
-        for k in set(b) | set(w):
-            d = w.get(k, 0) - b.get(k, 0)
-            if d > 0:
-                added[k] = d
-            elif d < 0:
-                removed[k] = -d
-        bot.diff = {'added': added, 'removed': removed,
-                    'chars_to': wc - bc, 'chars_from': bc - wc}
-    diff = bot.diff
+        bot.diff = board_diff(bot, bot.work_base, bot.work)
+    return diff_pick(bot, dec, bot.diff)
+
+
+def board_diff(bot, before, after):
+    """The figures the engine's action added and removed, and the
+    Characters that came and went: {(region, nation, unit): n} ..."""
+    b, bc = figure_counts(before, bot.names)
+    w, wc = figure_counts(after, bot.names)
+    added, removed = {}, {}
+    for k in set(b) | set(w):
+        d = w.get(k, 0) - b.get(k, 0)
+        if d > 0:
+            added[k] = d
+        elif d < 0:
+            removed[k] = -d
+    return {'added': added, 'removed': removed,
+            'chars_to': wc - bc, 'chars_from': bc - wc}
+
+
+def diff_pick(bot, dec, diff):
+    """diff_answer's answer read off one board diff (consumed as it
+    answers: a figure answered is taken off it)."""
     ctx = dec.get('context') or {}
+    if dec['kind'] == 'SEPARATE_COMPANIONS':
+        # a card's separation the engine made inside the card (I Will Go
+        # Alone): the Companions now on the map, one by one, then where
+        # each went
+        to = {}
+        for (r, c) in diff['chars_to']:
+            to.setdefault(c, r)
+        done = diff.setdefault('separated', [])
+        for o in opts(dec, 'separate'):
+            c = o.get('character')
+            if c in to and c not in done:
+                done.append(c)
+                return o['o']
+        for o in opts(dec, 'separate_to'):
+            if any(to.get(c) == o.get('to') for c in done):
+                return o['o']
+        return None
     if dec['kind'] == 'ARMY_MOVE':
         # a card's Army moves the engine made inside the card
         if getattr(bot, 'work_action', None) != 'play_event':
@@ -3084,9 +3455,26 @@ def diff_answer(bot, dec):
     words = str(ctx.get('question', '')).replace('?', ' ').split()
     region = next((wd for wd in words if wd in bot.names.region_in), None)
     nation = next((wd for wd in words if wd in bot.names.nation_in), None)
+    counts = [o for o in opts(dec, 'card_choice') if o.get('count') is not None]
+    where = question_region(bot, ctx.get('question'))
+    if counts and where is not None:
+        # a recruitment card's count in one region (Many Kings, Pits of
+        # Mordor ... when the Regulars run short: "How many Regulars in
+        # <region>?"): as many as the engine put there; that region is
+        # then done (a later "Recruit where?" picks among the others)
+        want = sum(n for k, n in diff['added'].items() if k[0] == where)
+        best = min(counts, key=lambda o: (abs(int(o['count']) - want),
+                                          int(o['count'])))
+        for k in [k for k in diff['added'] if k[0] == where]:
+            del diff['added'][k]
+        return best['o']
     unit_opts = [o for o in opts(dec, 'card_choice')
                  if str(o.get('answer', '')).upper() in UNIT_ANSWERS]
     if unit_opts:
+        # ("Recruit which Sauron figure in Dol Guldur?": REGULAR / ELITE /
+        # skip, asked once per figure)
+        if region is None:
+            region = where
         for o in unit_opts:
             unit = UNIT_ANSWERS[str(o['answer']).upper()]
             for k, n in diff['added'].items():
@@ -3094,7 +3482,8 @@ def diff_answer(bot, dec):
                         nation in (None, k[1]):
                     diff['added'][k] = n - 1
                     return o['o']
-        return None
+        # the engine put no more of them there
+        return first(opts(dec, 'card_choice', skip=True))
     best = None
     for o in opts(dec, 'card_choice'):
         s = 0
@@ -3122,10 +3511,61 @@ def diff_answer(bot, dec):
             s += sum(1 for k in diff['chars_from'] if k[1] == c)
         if s > 0 and (best is None or s > best[0]):
             best = (s, o['o'])
+    if best is None and dec['kind'] == 'CARD_CHOICE' and not any(
+            diff[k] for k in ('added', 'removed', 'chars_to', 'chars_from')) \
+            and ctx.get('card') and ctx.get('card') == getattr(bot, 'work_card', None) \
+            and bot.work is not None and bot.names.card_key((getattr(
+                bot.work, 'pending_card_option', None) or {}).get(
+                'card_id')) != ctx.get('card'):
+        # (the engine asks nothing more of this card: no pending option of
+        # its own; another one may be open, e.g. the Palantir's draw)
+        # the engine's card had no effect on the board (Half-orcs and
+        # Goblin-men with no Isengard figure left: it recruits nothing),
+        # while the referee still asks: any answer does what the engine
+        # did, nothing; skip where offered
+        o = first(opts(dec, 'card_choice', skip=True)) or first(
+            opts(dec, 'card_choice'))
+        if o is not None:
+            diff['no_effect'] = True
+            return o
     return best[1] if best else None
 
 
+def question_region(bot, question):
+    """The region a card's question names at its end ("How many Regulars
+    in South Rh\u00fbn?"), as a protocol key, or None."""
+    q = str(question or '')
+    if ' in ' not in q:
+        return None
+    tail = plain(q.rsplit(' in ', 1)[1].rstrip('?').strip())
+    table = getattr(bot.names, 'region_by_plain', None)
+    if table is None:
+        table = dict((plain(k), k) for k in bot.names.region_in)
+        bot.names.region_by_plain = table
+    return table.get(tail)
+
+
+def m_separate(bot, st, dec, a):
+    """A card's separation (I Will Go Alone, The Breaking of the
+    Fellowship): the engine's card option names the Companions and the
+    region; the referee asks them one by one, then the region."""
+    if a.action_type != 'card_option':
+        return None
+    ch = (a.params or {}).get('choices') or {}
+    comps = [CHAR_OUT.get(c) or CHAR_OUT.get(str(c)) for c in ch.get('companions') or []]
+    removed = ch.get('destination') == '__remove_from_play__'
+    dest = None if removed else bot.names.slug(ch.get('destination'))
+    if not comps or None in comps or not (dest or removed):
+        return None
+    # the plan of this action only (made for every action matched; the
+    # search's pick becomes bot.plan, which answers the rest)
+    plan = SeparatePlan(comps, dest)
+    o = plan.answer(dec)
+    return Match(o, plan, chain=True) if o is not None else None
+
+
 MAPPERS = {
+    'SEPARATE_COMPANIONS': m_separate,
     'ACTION': m_action,
     'FELLOWSHIP_PHASE': m_fellowship,
     'HUNT_ALLOCATION': m_hunt_allocation,
@@ -3202,10 +3642,10 @@ def rule_card_choice(bot, dec, view):
         guide = f.get('guide')
         return min(chars, key=lambda o: (o['character'] == guide,
                                          level.get(o['character'], 2)))['o']
-    draws = opts(dec, 'draw')
+    draws = [o for o in opts(dec, 'draw') if not o.get('skip')]
     if draws:
         # a bonus draw of the Free Peoples (Gandalf the Grey as Guide):
-        # the deck with more cards left
+        # the deck with more cards left (always drawn, as the engine does)
         decks = ((view.get('cards') or {}).get('decks') or {}).get(
             side_out(bot.memo.side)) or {}
         return max(draws, key=lambda o: decks.get(o.get('deck'), 0))['o']
@@ -3215,6 +3655,12 @@ def rule_card_choice(bot, dec, view):
 def rule_end(bot, dec, view):
     """the engine has no further move of this kind: end"""
     return first(opts(dec, 'end'))
+
+
+def rule_reroll(bot, dec, view):
+    """the Leader re-roll is taken (the official rules ask it; the engine
+    always re-rolls: a re-roll can only add hits)"""
+    return first([o for o in opts(dec, 'card_choice') if o.get('answer') == 'reroll'])
 
 
 def rule_join(bot, dec, view):
@@ -3264,6 +3710,7 @@ RULES = {
     'MOVE_MINIONS': rule_end,
     'MOVE_COMPANIONS': rule_end,
     'JOIN_GROUP': rule_join,
+    'LEADER_REROLL': rule_reroll,
 }
 
 
