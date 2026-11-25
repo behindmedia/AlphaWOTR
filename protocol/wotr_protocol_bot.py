@@ -419,6 +419,8 @@ class GameMemo(object):
         self.messenger_used = False      # Mouth of Sauron: Muster as Army
         self.fellowship_acted = False    # moved or hid on the Mordor Track
         self.in_mordor = False
+        self.eagles = False              # The Eagles are Coming! played last
+        self.eagles_from = None          # ... the region (slug) it struck
 
     def event(self, ev):
         kind = ev.get('kind')
@@ -434,6 +436,14 @@ class GameMemo(object):
             if (ev.get('side') == 'SHADOW' and ev.get('face') == 'MUSTER'
                     and ev.get('action') in ('move_armies', 'attack')):
                 self.messenger_used = True
+        # The Eagles are Coming!: the region of the Nazgul it struck (where
+        # the survivors fly from; setup_card_choice, wotr #1431)
+        if kind == 'card_played':
+            self.eagles = ev.get('card') == 'fp-char-18'
+            self.eagles_from = None
+        elif kind == 'figure_eliminated' and self.eagles and \
+                ev.get('unit') == 'nazgul':
+            self.eagles_from = ev.get('region')
 
 
 def character_figure(key, by_name):
@@ -926,6 +936,7 @@ class LeagueSearcher(Searcher):
     AFTER = 0.04            # after the certain line: the unit rule, the answer
     FIRST_TAIL = 0.12       # the tail of a kind not seen yet (no kind seen)
     FIRST_CERTAIN = 0.05    # the certain line's allowance, a kind not seen yet
+    FLOOR = 0.05            # the reserve's least share of the time left
     SHAPE = 1.3             # the simulation budget: the rate's estimate x this
     KEEP = 8                # recent figures kept per kind
 
@@ -1032,13 +1043,17 @@ class LeagueSearcher(Searcher):
         """Seconds kept back after the search for what follows it (see
         AFTER): 1.5 x the tail's most of the last KEEP (a kind not seen: the
         most of any kind, else FIRST_TAIL), plus the certain line's
-        allowance (its recent mean, at most a sixth of `room`), plus AFTER."""
+        allowance (1.5 x its most of the last KEEP, at most a sixth of
+        `room`), plus AFTER; at least FLOOR of `room`.  (wotr #1431: the
+        certain line's mean, 0.05 s, left nothing for a 1,900-action menu,
+        where it took 0.8-2.4 s and overran the deadline it checks only
+        between its steps: 6 timeouts in 400 games at a 30 s clock.)"""
         tails = self.tails.get(kind) or \
             [max(v) for v in self.tails.values() if v] or [self.FIRST_TAIL]
         certain = self.certains.get(kind)
-        certain = sum(certain) / len(certain) if certain else \
-            self.FIRST_CERTAIN
-        return max(tails) * 1.5 + min(certain, room / 6.0) + self.AFTER
+        certain = max(certain) * 1.5 if certain else self.FIRST_CERTAIN
+        return max(max(tails) * 1.5 + min(certain, room / 6.0) + self.AFTER,
+                   self.FLOOR * room)
 
     def deadline_plan(self, kind, now=None):
         """(simulations, the search's deadline) for a decision with an
@@ -1203,6 +1218,10 @@ class LeagueSearcher(Searcher):
             # its budget `sims`), and whether the deadline stopped it
             out['run'] = timing.get('simulations_run')
             out['stopped'] = timing.get('stopped')
+            # the search's phases, for the decision log (#1431: where a slow
+            # decision's time went)
+            out['timing'] = dict((k, round(v, 3) if isinstance(v, float) else v)
+                                 for k, v in timing.items())
         return pick, out
 
     @staticmethod
@@ -1614,6 +1633,38 @@ class RetreatPlan(Plan):
         if self.to is None:
             return first(opts(dec, 'stand'))
         return first(opts(dec, 'retreat', region=self.to))
+
+
+class UnitComboPlan(Plan):
+    """Cirdan's Ships' recruitment (the engine's one option {'region',
+    'unit_combo': '2regular' / 'mixed' / '2elite'}): the referee asks
+    "Recruit where?" when more than one coastal region qualifies, then
+    "Recruit which Elves figure in <region>?" (REGULAR / ELITE) once per
+    figure (wotr #1431: answered by default before)."""
+    kinds = ('CARD_CHOICE',)
+    name = 'unit-combo'
+    UNITS = {'2regular': ['REGULAR', 'REGULAR'], 'mixed': ['REGULAR', 'ELITE'],
+             '2elite': ['ELITE', 'ELITE']}
+
+    def __init__(self, card, region, combo):
+        self.card = card
+        self.region = region
+        self.units = list(self.UNITS.get(str(combo), []))
+
+    def answer(self, dec):
+        if str((dec.get('context') or {}).get('card', '')) != self.card:
+            return None
+        where = [o for o in opts(dec, 'card_choice') if o.get('region')]
+        if where:
+            return first([o for o in where if o['region'] == self.region])
+        cand = [o for o in opts(dec, 'card_choice')
+                if str(o.get('answer', '')).upper() in ('REGULAR', 'ELITE')]
+        if not cand or not self.units:
+            return None
+        want = self.units.pop(0)
+        o = first([o for o in cand if str(o['answer']).upper() == want])
+        # (the pool short of one kind: the referee offers only the other)
+        return o if o is not None else first(cand)
 
 
 class AnswerPlan(Plan):
@@ -2620,6 +2671,43 @@ def setup_card_choice(bot, st, dec, view):
                     'max_count': max(int(o['count']) for o in counts)}
                 pc[role + '_combat_card'] = card
                 return ('action', None)
+    targets = [o for o in counts if o.get('character')]
+    if b and targets and card and plain(getattr(cards_mod.get_card(card),
+                                               'combat_name', '') or '') == 'wordsofpower':
+        # Words of Power's Companion (the Combat card of The Ringwraiths Are
+        # Abroad, Worn with Sorrow and Toil, The Lidless Eye; wotr #1431):
+        # the engine's pre-roll target pick (ai._maybe_combat_effect_choice_
+        # phase: effect_choice 'targets', printed names; the search's
+        # combat_effect_choice {'target': name})
+        names = [CHAR_IN.get(o['character']) for o in targets]
+        if None not in names:
+            attacker = side_in(b.get('attacker')) is me
+            rnd = int(b.get('round', 1))
+            pc = _battle(bot, st, view, 'combat_effect_choice', rnd - 1)
+            if pc is not None:
+                role = 'atk' if attacker else 'def'
+                pc['effect_choice'] = {
+                    'stage': 'pre', 'owner': role, 'effect': 'words_of_power',
+                    'card_id': card, 'targets': names}
+                pc[role + '_combat_card'] = card
+                return ('action', None)
+    if me is SH and str(ctx.get('card', '')) == 'fp-char-18' and regions:
+        # The Eagles are Coming!: where the surviving Nazgul fly, the
+        # Shadow's choice (event_effects._effect_eagles_are_coming's chained
+        # stage {'eagles_dest', '_eagles_from'}; wotr #1431); from the region
+        # of the Nazgul the card struck (Memo.eagles_from), else the one
+        # Shadow Army with Nazgul next to a Free Peoples Companion
+        frm = bot.names.region(bot.memo.eagles_from) if bot.memo.eagles_from \
+            else eagles_source(bot, view)
+        if frm is not None:
+            cid = bot.names.card('fp-char-18')
+            st.pending_card_option = {
+                'card_id': cid or 'The Eagles are Coming',
+                'card_name': 'The Eagles are Coming', 'side': 'fp',
+                'decider': 'sh', 'direct': True,
+                'options': [{'eagles_dest': bot.names.region(o['region']),
+                             '_eagles_from': frm} for o in regions]}
+            return ('action', None)
     payers = [o for o in counts if o.get('character')]
     if b and payers and card and plain(getattr(cards_mod.get_card(card),
                                               'combat_name', '') or '') == 'mightyattack':
@@ -2711,6 +2799,25 @@ def setup_card_choice(bot, st, dec, view):
                                 {'use_hunt_reduction': 0}]}
                 return ('action', None)
     return None
+
+
+def eagles_source(bot, view):
+    """The region of the Shadow Army with Nazgul The Eagles are Coming! hit
+    when no Nazgul died there (the Memo saw none eliminated): the one with
+    Nazgul in or next to a region with a Free Peoples Companion, else None."""
+    regions = view.get('regions') or {}
+    fp_chars = set(k for k in CHAR_IN if k not in MINION_KEYS and k != 'gollum')
+    with_comp = set(r for r, x in regions.items()
+                    if fp_chars & set((x or {}).get('characters') or []))
+    found = []
+    for r, x in regions.items():
+        if not any(u.get('unit') == 'nazgul' for u in (x or {}).get('units') or []):
+            continue
+        k = bot.names.region(r)
+        near = set(bot.names.slug(a) for a in BOARD.adjacent(k)) if k else set()
+        if r in with_comp or near & with_comp:
+            found.append(k)
+    return found[0] if len(found) == 1 else None
 
 
 def mighty_payer(bot, st, b, payers):
@@ -3262,6 +3369,12 @@ def m_card_choice(bot, st, dec, a):
                                bot.names.card_key(a.params.get('card_id')))
             o = plan.answer(dec)
             return Match(o, plan, chain=True) if o is not None else None
+        if ch.get('unit_combo') is not None:
+            plan = UnitComboPlan(bot.names.card_key(a.params.get('card_id')),
+                                 bot.names.slug(ch.get('region')),
+                                 ch['unit_combo'])
+            o = plan.answer(dec)
+            return Match(o, plan, chain=True) if o is not None else None
         if isinstance(ch.get('rage_split'), dict):
             plan = RageSplitPlan(ch['rage_split'])
             o = plan.answer(dec)
@@ -3274,6 +3387,10 @@ def m_card_choice(bot, st, dec, a):
         o = first(opts(dec, 'card_choice', skip=True)) or first(opts(dec, 'end'))
         return Match(o, chain=True) if o is not None else None
     if t == 'combat_effect_choice':
+        target = (a.params or {}).get('target')
+        if target is not None:
+            # (Words of Power's Companion: the printed name; wotr #1431)
+            return _m(opts(dec, 'card_choice', character=CHAR_OUT.get(target)))
         return _m(opts(dec, 'card_choice', count=int((a.params or {}).get('count', 0))))
     if t == 'combat_retreat':
         return _m(opts(dec, 'card_choice',
@@ -3636,6 +3753,14 @@ def rule_card_choice(bot, dec, view):
     q = str(ctx.get('question', '')).lower()
     answers = dict((str(o.get('answer', '')).lower(), o['o'])
                    for o in opts(dec, 'card_choice'))
+    paths = [o for o in opts(dec, 'card_choice')
+             if o.get('region') or (o.get('from') and o.get('to'))]
+    if q == 'which way?' and paths and len(set(
+            o.get('to') or o.get('region') for o in paths)) == 1:
+        # Through a Day and a Night's way to a destination already chosen
+        # (by the engine's own answer, or by the referee in a scenario: wotr
+        # #1431): every way ends there and is free, so the shortest
+        return min(paths, key=lambda o: len(str(o.get('answer', '')).split('>')))['o']
     f = view.get('fellowship') or {}
     if 'corruption' in answers and 'eliminate' in answers:
         # Lure of the Ring (the Shadow's card, the Free Peoples choose):
