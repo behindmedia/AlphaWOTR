@@ -290,6 +290,35 @@ Answer RetreatPlan::answer(const Value& dec) {
 AnswerPlan::AnswerPlan(const std::string& kind, std::string okind_) : okind(std::move(okind_)) { kinds = {kind}; name = "answer"; }
 Answer AnswerPlan::answer(const Value& dec) { return first_of(opts(dec, okind)); }
 
+// ---- UnitComboPlan (protocol/wotr_protocol_bot.py, line 1638) ----
+UnitComboPlan::UnitComboPlan(std::string card_, Value region_, const std::string& combo) : card(std::move(card_)), region(std::move(region_)) {
+    kinds = {"CARD_CHOICE"}; name = "unit-combo";
+    if (combo == "2regular") units = {"REGULAR", "REGULAR"};
+    else if (combo == "mixed") units = {"REGULAR", "ELITE"};
+    else if (combo == "2elite") units = {"ELITE", "ELITE"};
+}
+Answer UnitComboPlan::answer(const Value& dec) {
+    const Value& c = ctx(dec);
+    if (!(at(c, "card").kind == Value::Str ? at(c, "card").s == card : card.empty())) return std::nullopt;
+    std::vector<const Value*> where;
+    for (auto* o : opts(dec, "card_choice")) if (at(*o, "region").truthy()) where.push_back(o);
+    if (!where.empty()) {
+        for (auto* o : where) if (equal(at(*o, "region"), region) && at(*o, "region").kind == region.kind) return o_of(o);
+        return std::nullopt;
+    }
+    std::vector<const Value*> cand;
+    for (auto* o : opts(dec, "card_choice")) {
+        const Value& a = at(*o, "answer");
+        std::string u = a.kind == Value::Str ? a.s : "";
+        for (char& ch : u) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+        if (u == "REGULAR" || u == "ELITE") cand.push_back(o);
+    }
+    if (cand.empty() || units.empty()) return std::nullopt;
+    const std::string want = units.front(); units.erase(units.begin());
+    for (auto* o : cand) { std::string u = at(*o, "answer").s; for (char& ch : u) ch = char(std::toupper(static_cast<unsigned char>(ch))); if (u == want) return o_of(o); }
+    return o_of(cand[0]);   // (the pool short of one kind: the referee offers only the other)
+}
+
 // ---- RULES ----
 namespace {
 Answer rule_card_choice(const Value& dec, const Value& view, int side, bool work) {
@@ -308,6 +337,20 @@ Answer rule_card_choice(const Value& dec, const Value& view, int side, bool work
         const Value& a = at(*o, "answer");
         const std::string k = lower(a.kind == Value::Str ? a.s : a.is_null() ? "" : std::to_string(a.as_int()));
         if (has_o(o)) answers[k] = at(*o, "o").as_int();   // (dict(): the last one wins)
+    }
+    {   // Through a Day and a Night's way to a destination already chosen (line 3758; wotr #1431): the shortest
+        std::vector<const Value*> paths;
+        for (auto* o : opts(dec, "card_choice"))
+            if (at(*o, "region").truthy() || (at(*o, "from").truthy() && at(*o, "to").truthy())) paths.push_back(o);
+        std::set<std::string> ends;
+        for (auto* o : paths) { const Value& e = at(*o, "to").truthy() ? at(*o, "to") : at(*o, "region"); ends.insert(e.kind == Value::Str ? e.s : "\x01"); }
+        if (q == "which way?" && !paths.empty() && ends.size() == 1) {
+            auto steps = [](const Value* o) { const Value& a = at(*o, "answer"); const std::string s = a.kind == Value::Str ? a.s : "";
+                return size_t(std::count(s.begin(), s.end(), '>')) + 1; };
+            const Value* best = paths[0];
+            for (auto* o : paths) if (steps(o) < steps(best)) best = o;
+            return o_of(best);
+        }
     }
     const Value& fs = or_empty(view, "fellowship");
     if (answers.count("corruption") && answers.count("eliminate")) {

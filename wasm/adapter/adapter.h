@@ -50,6 +50,9 @@ struct Memo {
     int side = 0;                       // 0 FP, 1 SH
     void* rng = nullptr;                // random.Random(seed) (wotr_random handle; owned by the caller)
     bool messenger_used = false, fellowship_acted = false, in_mordor = false;
+    // The Eagles are Coming! played last, and the region (protocol slug) of the Nazgul it struck ('' none; wotr #1431)
+    bool eagles = false;
+    std::string eagles_from;
 };
 
 class Adapter {
@@ -138,6 +141,8 @@ private:
     Matched companion_action_match(const awjson::Value& dec, const awjson::Value& ch);
     // mighty_payer: the Companion the engine's AI menu has pay Mighty Attack's Leadership (none: -1)
     int64_t mighty_payer(pyobj::Obj* st, const awjson::Value& b, const std::vector<const awjson::Value*>& payers);
+    // eagles_source(bot, view): the engine key of the one Shadow Army with Nazgul next to a Free Peoples Companion ('')
+    std::string eagles_source(const awjson::Value& view);
 };
 
 }  // namespace awad

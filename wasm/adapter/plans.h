@@ -100,6 +100,13 @@ struct RetreatPlan : Plan {
     explicit RetreatPlan(std::optional<awjson::Value> to_);
     Answer answer(const awjson::Value& dec) override;
 };
+// Cirdan's Ships' recruitment (the engine's one option {'region', 'unit_combo': '2regular' / 'mixed' / '2elite'}):
+// "Recruit where?" when several coastal regions qualify, then REGULAR / ELITE once per figure (wotr #1431)
+struct UnitComboPlan : Plan {
+    std::string card; awjson::Value region; std::vector<std::string> units;
+    UnitComboPlan(std::string card_, awjson::Value region_, const std::string& combo);
+    Answer answer(const awjson::Value& dec) override;
+};
 struct AnswerPlan : Plan {
     std::string okind;
     AnswerPlan(const std::string& kind, std::string okind_);

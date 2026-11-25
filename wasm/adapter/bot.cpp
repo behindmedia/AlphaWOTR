@@ -152,6 +152,10 @@ std::string Bot::handle(const Value& msg) {
                 at(ev, "action").kind == Value::Str && (at(ev, "action").s == "move_armies" || at(ev, "action").s == "attack"))
                 memo.messenger_used = true;
         }
+        // The Eagles are Coming!: the region of the Nazgul it struck (GameMemo.event, wotr #1431)
+        if (k == "card_played") { memo.eagles = at(ev, "card").kind == Value::Str && at(ev, "card").s == "fp-char-18"; memo.eagles_from.clear(); }
+        else if (k == "figure_eliminated" && memo.eagles && at(ev, "unit").kind == Value::Str && at(ev, "unit").s == "nazgul")
+            memo.eagles_from = at(ev, "region").kind == Value::Str ? at(ev, "region").s : "";
         return "";
     }
     if (ty == "decide") return decide(msg);

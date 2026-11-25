@@ -664,6 +664,65 @@ Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value
             }
         }
     }
+    // Words of Power's Companion (protocol/wotr_protocol_bot.py setup_card_choice, line 2676; wotr #1431): the Combat
+    // card of The Ringwraiths Are Abroad, Worn with Sorrow and Toil, The Lidless Eye (combat_name Words of Power);
+    // the engine's pre-roll target pick (effect_choice 'targets', printed names)
+    {
+        std::vector<const Value*> targets;
+        for (const Value* o : counts) if (at(*o, "character").truthy()) targets.push_back(o);
+        const std::string wk = at(ctx, "card").kind == Value::Str ? at(ctx, "card").s : "";
+        if (b.truthy() && !targets.empty() && !card.empty() && (wk == "sh-char-15" || wk == "sh-char-18" || wk == "sh-char-23")) {
+            Obj* names = m.list();
+            bool all = true;
+            for (const Value* o : targets) {
+                auto ci = at(*o, "character").kind == Value::Str ? t.char_in.find(at(*o, "character").s) : t.char_in.end();
+                if (ci == t.char_in.end()) { all = false; break; }
+                names->k.push_back(m.str(ci->second));
+            }
+            if (all) {
+                const bool attacker = side_in(at(b, "attacker").s) == me;
+                const int64_t rnd = b.get("round") ? at(b, "round").as_int() : 1;
+                Obj* pc = battle(st, view, memo, "combat_effect_choice", rnd - 1);
+                if (pc) {
+                    const std::string role = attacker ? "atk" : "def";
+                    Obj* ec = m.dict();
+                    m.dict_set(ec, m.str("stage"), m.str("pre"));
+                    m.dict_set(ec, m.str("owner"), m.str(role));
+                    m.dict_set(ec, m.str("effect"), m.str("words_of_power"));
+                    m.dict_set(ec, m.str("card_id"), m.str(card));
+                    m.dict_set(ec, m.str("targets"), names);
+                    m.dict_set(pc, m.str("effect_choice"), ec);
+                    m.dict_set(pc, m.str(role + "_combat_card"), m.str(card));
+                    r.label = "action"; return r;
+                }
+            }
+        }
+        // The Eagles are Coming!: where the surviving Nazgul fly, the Shadow's choice (event_effects.
+        // _effect_eagles_are_coming's chained stage {'eagles_dest', '_eagles_from'}); from the region the card struck
+        // (Memo.eagles_from), else the one Shadow Army with Nazgul next to a Free Peoples Companion
+        if (me == 1 && wk == "fp-char-18" && !regions.empty()) {
+            std::string frm;
+            if (!memo.eagles_from.empty()) { auto ri = t.region_in.find(memo.eagles_from); if (ri != t.region_in.end()) frm = ri->second; }
+            else frm = eagles_source(view);
+            if (!frm.empty()) {
+                Obj* options = m.list();
+                for (const Value* o : regions) {
+                    auto ri = t.region_in.find(at(*o, "region").s);
+                    Obj* d = m.dict();
+                    m.dict_set(d, m.str("eagles_dest"), ri == t.region_in.end() ? m.none() : m.str(ri->second));
+                    m.dict_set(d, m.str("_eagles_from"), m.str(frm));
+                    options->k.push_back(d);
+                }
+                const std::string ec = t.card("fp-char-18");
+                Obj* opt = m.dict();
+                auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+                put("card_id", m.str(ec.empty() ? "The Eagles are Coming" : ec)); put("card_name", m.str("The Eagles are Coming"));
+                put("side", m.str("fp")); put("decider", m.str("sh")); put("direct", m.boolean(true)); put("options", options);
+                m.set_attr(st, "pending_card_option", opt);
+                r.label = "action"; return r;
+            }
+        }
+    }
     std::vector<const Value*> payers;
     for (const Value* o : counts) if (at(*o, "character").truthy()) payers.push_back(o);
     // Mighty Attack's payer (the official rules ask it; the engine's round cursor asks it as a combat_effect_choice
@@ -795,6 +854,31 @@ Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value
         }
     }
     r.label = ""; return r;                                    // None: no engine decision
+}
+
+// eagles_source (protocol/wotr_protocol_bot.py, line 2804): the Army The Eagles are Coming! hit when the Memo saw no
+// Nazgul eliminated: the one with Nazgul in or next to a region with a Free Peoples Companion ('' none or several)
+std::string Adapter::eagles_source(const Value& view) {
+    const Value& regions = or_empty(view, "regions");
+    std::set<std::string> fp_chars;
+    for (const auto& kv : t.char_in)
+        if (std::find(t.minion_keys.begin(), t.minion_keys.end(), kv.first) == t.minion_keys.end() && kv.first != "gollum") fp_chars.insert(kv.first);
+    std::set<std::string> with_comp;
+    for (const auto& kv : regions.obj)
+        for (const Value& c : or_empty(kv.second, "characters").arr)
+            if (c.kind == Value::Str && fp_chars.count(c.s)) { with_comp.insert(kv.first); break; }
+    std::vector<std::string> found;
+    for (const auto& kv : regions.obj) {
+        bool naz = false;
+        for (const Value& u : or_empty(kv.second, "units").arr) if (at(u, "unit").kind == Value::Str && at(u, "unit").s == "nazgul") naz = true;
+        if (!naz) continue;
+        auto ri = t.region_in.find(kv.first);
+        const std::string k = ri == t.region_in.end() ? "" : ri->second;
+        bool near = false;
+        if (!k.empty()) { auto ai = t.adjacent.find(k); if (ai != t.adjacent.end()) for (const auto& a : ai->second) if (with_comp.count(slug(a))) near = true; }
+        if (with_comp.count(kv.first) || near) found.push_back(k);
+    }
+    return found.size() == 1 ? found[0] : "";
 }
 
 // mighty_payer: ai_policies._mighty_payer_priority over the engine's Companions in the battle (the lowest Leadership,

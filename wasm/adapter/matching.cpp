@@ -341,6 +341,14 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
                 r.make_plan = [plan]() { return std::shared_ptr<Plan>(plan); };
                 return r;
             }
+            if (ch.get("unit_combo") && !at(ch, "unit_combo").is_null()) {   // Cirdan's Ships (line 3372; wotr #1431)
+                auto plan = std::make_shared<UnitComboPlan>(card_key(pstr("card_id")), slugv(at(ch, "region")), pstr_of(ch, "unit_combo"));
+                const auto o = plan->answer(dec);
+                if (!o) return r;
+                r.ok = true; r.o = *o; r.has_plan = true; r.chain = true;
+                r.make_plan = [plan]() { return std::shared_ptr<Plan>(plan); };
+                return r;
+            }
             if (ch.get("rage_split") && at(ch, "rage_split").kind == Value::Obj) {
                 auto plan = std::make_shared<RageSplitPlan>(at(ch, "rage_split"));
                 const auto o = plan->answer(dec);
@@ -362,7 +370,11 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
             if (!o) return r;
             r.ok = true; r.o = at(*o, "o").as_int(); r.chain = true; return r;
         }
-        if (ty == "combat_effect_choice") return mm(opts(dec, "card_choice", {f("count", I(at(p, "count").kind == Value::Null ? 0 : at(p, "count").as_int()))}));
+        if (ty == "combat_effect_choice") {
+            // (Words of Power's Companion: the printed name; m_card_choice, line 3390; wotr #1431)
+            if (p.get("target") && !at(p, "target").is_null()) { const std::string ck = char_out(pstr("target")); return mm(opts(dec, "card_choice", {fstr("character", ck, !ck.empty())})); }
+            return mm(opts(dec, "card_choice", {f("count", I(at(p, "count").kind == Value::Null ? 0 : at(p, "count").as_int()))}));
+        }
         if (ty == "combat_retreat") { const std::string rg = pslug("to_region"); return mm(opts(dec, "card_choice", {fstr("region", rg, !rg.empty())})); }
         if (ty == "army_move" || ty == "army_attack") {
             const std::string fr = pslug("from"), to = pslug("to");
