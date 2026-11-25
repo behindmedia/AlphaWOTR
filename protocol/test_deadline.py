@@ -64,8 +64,13 @@ def test_plan():
     s.tails['ACTION'] = [0.02, 0.08, 0.05]
     s.certains['ACTION'] = [0.01, 0.03]
     n, until = s.deadline_plan('ACTION', now=10.0)
-    reserve = 0.08 * 1.5 + 0.02 + s.AFTER
-    check(abs(until - (11.8 - reserve)) < 1e-9, 'the reserve: 1.5 x the most tail + the certain mean + AFTER')
+    reserve = 0.08 * 1.5 + 0.03 * 1.5 + s.AFTER
+    check(abs(until - (11.8 - reserve)) < 1e-9, 'the reserve: 1.5 x the most tail + 1.5 x the most certain line + AFTER')
+    # (wotr #1431) a long clock: at least FLOOR of the time left is kept back
+    s.deadline = 40.0
+    n2, until2 = s.deadline_plan('ACTION', now=10.0)
+    check(abs(until2 - (40.0 - s.FLOOR * 30.0)) < 1e-9, 'the reserve at least FLOOR of the time left (%.2f s of 30 s)' % (s.FLOOR * 30.0))
+    s.deadline = 11.8
     check(n == int(110.0 * (until - 10.0) * s.SHAPE), 'the budget from the mean rate (%d)' % n)
     s.certains['ACTION'] = [1.0]
     n, until2 = s.deadline_plan('ACTION', now=10.0)
